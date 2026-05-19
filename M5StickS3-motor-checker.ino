@@ -76,10 +76,18 @@ static bool sDisplayBlanked = false;
 static unsigned long sReadySinceMs = 0;
 
 // Sensitivity state
-enum class SensLevel : uint8_t { Low = 0, Mid, High };
+enum class SensLevel : uint8_t { Low = 0, Mid, High, Auto };
 static SensLevel sSensLevel = SensLevel::High;
+static double sAutoThreshold = 400000.0;
+static double sAutoThresholdUpper = Audio::kFftPeakRejectAbove;
 static const double kSensThresholds[] = {900000.0, 400000.0, 50000.0};
-static const char *const kSensLabels[] = {"LOW", "MID", "HIGH"};
+static const char *const kSensLabels[] = {"LOW", "MID", "HIGH", "AUTO"};
+
+// Auto-Calibration state
+static bool sIsCalibrating = false;
+static unsigned long sCalibrateStartMs = 0;
+static double sCalibrateSum = 0;
+static int sCalibrateCount = 0;
 
 // ==========================================
 // Classes
@@ -221,14 +229,24 @@ static void cycleSensitivity() {
     sSensLevel = SensLevel::Low;
     break;
   case SensLevel::Low:
+    sSensLevel = SensLevel::Auto;
+    break;
+  case SensLevel::Auto:
     sSensLevel = SensLevel::High;
     break;
   }
 }
 
 static double sensitivityThreshold() {
+  if (sSensLevel == SensLevel::Auto) return sAutoThreshold;
   return kSensThresholds[(uint8_t)sSensLevel];
 }
+
+static double sensitivityThresholdUpper() {
+  if (sSensLevel == SensLevel::Auto) return sAutoThresholdUpper;
+  return Audio::kFftPeakRejectAbove;
+}
+
 static const char *sensitivityLabel() {
   return kSensLabels[(uint8_t)sSensLevel];
 }
@@ -273,16 +291,41 @@ void handleButtons() {
     sReadySinceMs = millis();
     sForceUiRefresh = true;
   }
+
+  static bool sHasCalibratedThisPress = false;
+  static bool sWokeUpThisPressB = false;
+
   if (M5.BtnB.wasPressed()) {
+    sHasCalibratedThisPress = false;
+    sWokeUpThisPressB = false;
     if (sDisplayBlanked) {
       sDisplayBlanked = false;
       applyBrightnessStep();
       M5.Mic.begin(); // 마이크 다시 시작
-    } else {
-      cycleSensitivity();
+      sWokeUpThisPressB = true;
+      sReadySinceMs = millis();
+      sForceUiRefresh = true;
     }
-    sReadySinceMs = millis();
-    sForceUiRefresh = true;
+  }
+
+  if (!sDisplayBlanked && !sWokeUpThisPressB) {
+    if (M5.BtnB.pressedFor(1000) && !sHasCalibratedThisPress) {
+      sHasCalibratedThisPress = true;
+      sIsCalibrating = true;
+      sCalibrateStartMs = millis();
+      sCalibrateSum = 0;
+      sCalibrateCount = 0;
+      sReadySinceMs = millis();
+      sForceUiRefresh = true;
+    }
+
+    if (M5.BtnB.wasReleased()) {
+      if (!sHasCalibratedThisPress) {
+        cycleSensitivity();
+        sReadySinceMs = millis();
+        sForceUiRefresh = true;
+      }
+    }
   }
 }
 
@@ -317,14 +360,48 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
       peakIndex = i;
     }
   }
-  if (maxVal > Audio::kFftPeakRejectAbove) {
+
+  if (sIsCalibrating) {
+    if (millis() - sCalibrateStartMs < 1500) {
+      if (maxVal > 0) {
+        sCalibrateSum += maxVal;
+        sCalibrateCount++;
+      }
+      return true;
+    } else {
+      sIsCalibrating = false;
+      if (sCalibrateCount > 0) {
+        double avg = sCalibrateSum / sCalibrateCount;
+        sAutoThreshold = avg * 0.4;
+        sAutoThresholdUpper = avg * 3.0;
+      }
+      sSensLevel = SensLevel::Auto;
+      sForceUiRefresh = true;
+    }
+  }
+
+  if (maxVal > sensitivityThresholdUpper()) {
     maxVal = 0;
     peakIndex = 0;
   }
 
-  outDetected = (maxVal >= sensitivityThreshold());
+  bool isInstantDetected = (maxVal >= sensitivityThreshold());
 
-  if (peakIndex >= Audio::kFftBandBinLo && peakIndex <= Audio::kFftBandBinHi) {
+  static unsigned long sSignalContinuousStartMs = 0;
+  static bool sSignalContinuous = false;
+
+  if (isInstantDetected) {
+    if (!sSignalContinuous) {
+      sSignalContinuous = true;
+      sSignalContinuousStartMs = millis();
+    }
+    outDetected = (millis() - sSignalContinuousStartMs >= 300);
+  } else {
+    sSignalContinuous = false;
+    outDetected = false;
+  }
+
+  if (outDetected && peakIndex >= Audio::kFftBandBinLo && peakIndex <= Audio::kFftBandBinHi) {
     double y0 = vReal[peakIndex - 1];
     double y1 = vReal[peakIndex];
     double y2 = vReal[peakIndex + 1];
@@ -392,7 +469,11 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive) {
       spr.drawString(sensitivityLabel(), spr.width() - 5, 30);
 
       spr.setTextDatum(top_center);
-      if (rpmActive) {
+      if (sIsCalibrating) {
+        spr.setTextColor(UI::COLOR_SENS_LABEL);
+        spr.setFont(&fonts::FreeSans12pt7b);
+        spr.drawString("CALIBRATING", spr.width() / 2, 65);
+      } else if (rpmActive) {
         long rpm = (long)(currentHz * 60);
         spr.setFont(&fonts::FreeSansBold18pt7b);
         spr.setTextColor(UI::COLOR_RPM_VALUE);

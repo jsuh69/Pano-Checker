@@ -1,6 +1,7 @@
 #include <M5Unified.h>
 #include <arduinoFFT.h>
 #include <cmath>
+#include <Wire.h>
 #if defined(ESP32)
 #include <WiFi.h>
 #include <esp_bt.h>
@@ -76,15 +77,16 @@ static bool sDisplayBlanked = false;
 static unsigned long sReadySinceMs = 0;
 
 // Sensitivity state
-enum class SensLevel : uint8_t { Low = 0, Mid, High, Auto };
+enum class SensLevel : uint8_t { Low = 0, Mid, High, Vib, AutoMic, AutoVib };
 static SensLevel sSensLevel = SensLevel::High;
-static double sAutoThreshold = 400000.0;
-static double sAutoThresholdUpper = Audio::kFftPeakRejectAbove;
-static const double kSensThresholds[] = {900000.0, 400000.0, 50000.0};
-static const char *const kSensLabels[] = {"LOW", "MID", "HIGH", "AUTO"};
+static double sAutoThresholdMic = 400000.0;
+static double sAutoThresholdUpperMic = Audio::kFftPeakRejectAbove;
+static double sAutoThresholdVib = 5000.0;
+static double sAutoThresholdUpperVib = Audio::kFftPeakRejectAbove;
 
 // Auto-Calibration state
 static bool sIsCalibrating = false;
+static SensLevel sNextAutoLevel = SensLevel::AutoMic;
 static unsigned long sCalibrateStartMs = 0;
 static double sCalibrateSum = 0;
 static int sCalibrateCount = 0;
@@ -222,33 +224,43 @@ static void cycleBrightness() {
 
 static void cycleSensitivity() {
   switch (sSensLevel) {
-  case SensLevel::High:
-    sSensLevel = SensLevel::Mid;
-    break;
-  case SensLevel::Mid:
-    sSensLevel = SensLevel::Low;
-    break;
-  case SensLevel::Low:
-    sSensLevel = SensLevel::Auto;
-    break;
-  case SensLevel::Auto:
-    sSensLevel = SensLevel::High;
-    break;
+  case SensLevel::Low:     sSensLevel = SensLevel::Mid; break;
+  case SensLevel::Mid:     sSensLevel = SensLevel::High; break;
+  case SensLevel::High:    sSensLevel = SensLevel::Vib; break;
+  case SensLevel::Vib:     sSensLevel = SensLevel::Low; break;
+  case SensLevel::AutoMic: sSensLevel = SensLevel::Low; break;
+  case SensLevel::AutoVib: sSensLevel = SensLevel::Low; break;
   }
 }
 
 static double sensitivityThreshold() {
-  if (sSensLevel == SensLevel::Auto) return sAutoThreshold;
-  return kSensThresholds[(uint8_t)sSensLevel];
+  switch (sSensLevel) {
+    case SensLevel::Low: return 900000.0;
+    case SensLevel::Mid: return 400000.0;
+    case SensLevel::High: return 50000.0;
+    case SensLevel::Vib: return 5000.0;
+    case SensLevel::AutoMic: return sAutoThresholdMic;
+    case SensLevel::AutoVib: return sAutoThresholdVib;
+  }
+  return 900000.0;
 }
 
 static double sensitivityThresholdUpper() {
-  if (sSensLevel == SensLevel::Auto) return sAutoThresholdUpper;
+  if (sSensLevel == SensLevel::AutoVib) return sAutoThresholdUpperVib;
+  if (sSensLevel == SensLevel::AutoMic) return sAutoThresholdUpperMic;
   return Audio::kFftPeakRejectAbove;
 }
 
 static const char *sensitivityLabel() {
-  return kSensLabels[(uint8_t)sSensLevel];
+  switch (sSensLevel) {
+    case SensLevel::Low: return "LOW";
+    case SensLevel::Mid: return "MID";
+    case SensLevel::High: return "HIGH";
+    case SensLevel::Vib: return "VIB";
+    case SensLevel::AutoMic: return "AUTO(M)";
+    case SensLevel::AutoVib: return "AUTO(V)";
+  }
+  return "";
 }
 
 static void disableUnusedBluetooth() {
@@ -312,6 +324,11 @@ void handleButtons() {
     if (M5.BtnB.pressedFor(1000) && !sHasCalibratedThisPress) {
       sHasCalibratedThisPress = true;
       sIsCalibrating = true;
+      if (sSensLevel == SensLevel::Vib || sSensLevel == SensLevel::AutoVib) {
+         sNextAutoLevel = SensLevel::AutoVib;
+      } else {
+         sNextAutoLevel = SensLevel::AutoMic;
+      }
       sCalibrateStartMs = millis();
       sCalibrateSum = 0;
       sCalibrateCount = 0;
@@ -334,8 +351,31 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   outDetected = false;
   static int16_t rawBuffer[Audio::kSamples];
 
-  if (!M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
-    return false;
+  bool useVib = (sSensLevel == SensLevel::Vib || sSensLevel == SensLevel::AutoVib || (sIsCalibrating && sNextAutoLevel == SensLevel::AutoVib));
+
+  if (useVib) {
+    unsigned long next_sample = micros();
+    for (int i = 0; i < Audio::kSamples; i++) {
+      while (micros() - next_sample < 625) { /* busy wait */ }
+      next_sample += 625;
+      
+      Wire.beginTransmission(0x68);
+      Wire.write(0x0C);
+      Wire.endTransmission(false);
+      if (Wire.requestFrom(0x68, 6) == 6) {
+        int16_t ax = Wire.read() | (Wire.read() << 8);
+        int16_t ay = Wire.read() | (Wire.read() << 8);
+        int16_t az = Wire.read() | (Wire.read() << 8);
+        double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
+        rawBuffer[i] = (int16_t)(mag - 16384.0);
+      } else {
+        rawBuffer[i] = 0;
+      }
+    }
+  } else {
+    if (!M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
+      return false;
+    }
   }
 
   double mean = 0;
@@ -352,9 +392,13 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   FFT.compute(FFT_FORWARD);
   FFT.complexToMagnitude();
 
+  double currentFs = useVib ? 1600.0 : Audio::kSamplingFrequency;
+  int binLo = (150 * Audio::kSamples + (int)currentFs - 1) / (int)currentFs;
+  int binHi = (750 * Audio::kSamples) / (int)currentFs;
+
   double maxVal = 0;
   int peakIndex = 0;
-  for (int i = Audio::kFftBandBinLo; i <= Audio::kFftBandBinHi; i++) {
+  for (int i = binLo; i <= binHi; i++) {
     if (vReal[i] > maxVal) {
       maxVal = vReal[i];
       peakIndex = i;
@@ -372,10 +416,15 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
       sIsCalibrating = false;
       if (sCalibrateCount > 0) {
         double avg = sCalibrateSum / sCalibrateCount;
-        sAutoThreshold = avg * 0.4;
-        sAutoThresholdUpper = avg * 3.0;
+        if (sNextAutoLevel == SensLevel::AutoVib) {
+           sAutoThresholdVib = avg * 0.4;
+           sAutoThresholdUpperVib = avg * 3.0;
+        } else {
+           sAutoThresholdMic = avg * 0.4;
+           sAutoThresholdUpperMic = avg * 3.0;
+        }
       }
-      sSensLevel = SensLevel::Auto;
+      sSensLevel = sNextAutoLevel;
       sForceUiRefresh = true;
     }
   }
@@ -401,7 +450,7 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     outDetected = false;
   }
 
-  if (outDetected && peakIndex >= Audio::kFftBandBinLo && peakIndex <= Audio::kFftBandBinHi) {
+  if (outDetected && peakIndex >= binLo && peakIndex <= binHi) {
     double y0 = vReal[peakIndex - 1];
     double y1 = vReal[peakIndex];
     double y2 = vReal[peakIndex + 1];
@@ -409,9 +458,9 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     if (fabs(denom) > 1e-12) {
       double center = 0.5 * (y0 - y2) / denom;
       outHz =
-          (peakIndex + center) * (Audio::kSamplingFrequency / Audio::kSamples);
+          (peakIndex + center) * (currentFs / Audio::kSamples);
     } else {
-      outHz = (double)peakIndex * (Audio::kSamplingFrequency / Audio::kSamples);
+      outHz = (double)peakIndex * (currentFs / Audio::kSamples);
     }
   }
   return true;
@@ -520,6 +569,18 @@ void setup() {
   mic_cfg.pin_ws = 15;
   M5.Mic.config(mic_cfg);
   M5.Mic.begin();
+
+  // BMI270 Initialization
+  Wire.begin(47, 48, 400000); // SDA=47, SCL=48
+  Wire.beginTransmission(0x68);
+  Wire.write(0x7D); // PWR_CTRL
+  Wire.write(0x04); // accel enable
+  Wire.endTransmission();
+  delay(10);
+  Wire.beginTransmission(0x68);
+  Wire.write(0x40); // ACC_CONF
+  Wire.write(0xAC); // 1600Hz ODR, normal
+  Wire.endTransmission();
 
   // Serial.begin(115200);
 }

@@ -77,8 +77,10 @@ static bool sDisplayBlanked = false;
 static unsigned long sReadySinceMs = 0;
 
 // Sensitivity state
-enum class SensLevel : uint8_t { Low = 0, Mid, High, Vib, AutoMic, AutoVib };
+enum class SensLevel : uint8_t { Low = 0, Mid, High, Vib, Auto };
 static SensLevel sSensLevel = SensLevel::High;
+static bool sAutoIsVib = false; // Tracks if AUTO mode is evaluating VIB or MIC
+
 static double sAutoThresholdMic = 400000.0;
 static double sAutoThresholdUpperMic = Audio::kFftPeakRejectAbove;
 static double sAutoThresholdVib = 5000.0;
@@ -86,7 +88,6 @@ static double sAutoThresholdUpperVib = Audio::kFftPeakRejectAbove;
 
 // Auto-Calibration state
 static bool sIsCalibrating = false;
-static SensLevel sNextAutoLevel = SensLevel::AutoMic;
 static unsigned long sCalibrateStartMs = 0;
 static double sCalibrateSum = 0;
 static int sCalibrateCount = 0;
@@ -228,37 +229,37 @@ static void cycleSensitivity() {
   case SensLevel::Mid:     sSensLevel = SensLevel::High; break;
   case SensLevel::High:    sSensLevel = SensLevel::Vib; break;
   case SensLevel::Vib:     sSensLevel = SensLevel::Low; break;
-  case SensLevel::AutoMic: sSensLevel = SensLevel::Low; break;
-  case SensLevel::AutoVib: sSensLevel = SensLevel::Low; break;
+  case SensLevel::Auto:    sSensLevel = SensLevel::Low; break;
   }
 }
 
 static double sensitivityThreshold() {
+  if (sSensLevel == SensLevel::Auto) {
+    return sAutoIsVib ? sAutoThresholdVib : sAutoThresholdMic;
+  }
   switch (sSensLevel) {
     case SensLevel::Low: return 900000.0;
     case SensLevel::Mid: return 400000.0;
     case SensLevel::High: return 50000.0;
     case SensLevel::Vib: return 5000.0;
-    case SensLevel::AutoMic: return sAutoThresholdMic;
-    case SensLevel::AutoVib: return sAutoThresholdVib;
   }
   return 900000.0;
 }
 
 static double sensitivityThresholdUpper() {
-  if (sSensLevel == SensLevel::AutoVib) return sAutoThresholdUpperVib;
-  if (sSensLevel == SensLevel::AutoMic) return sAutoThresholdUpperMic;
+  if (sSensLevel == SensLevel::Auto) {
+    return sAutoIsVib ? sAutoThresholdUpperVib : sAutoThresholdUpperMic;
+  }
   return Audio::kFftPeakRejectAbove;
 }
 
 static const char *sensitivityLabel() {
+  if (sSensLevel == SensLevel::Auto) return "AUTO";
   switch (sSensLevel) {
     case SensLevel::Low: return "LOW";
     case SensLevel::Mid: return "MID";
     case SensLevel::High: return "HIGH";
     case SensLevel::Vib: return "VIB";
-    case SensLevel::AutoMic: return "AUTO(M)";
-    case SensLevel::AutoVib: return "AUTO(V)";
   }
   return "";
 }
@@ -324,11 +325,7 @@ void handleButtons() {
     if (M5.BtnB.pressedFor(1000) && !sHasCalibratedThisPress) {
       sHasCalibratedThisPress = true;
       sIsCalibrating = true;
-      if (sSensLevel == SensLevel::Vib || sSensLevel == SensLevel::AutoVib) {
-         sNextAutoLevel = SensLevel::AutoVib;
-      } else {
-         sNextAutoLevel = SensLevel::AutoMic;
-      }
+      sAutoIsVib = (sSensLevel == SensLevel::Vib || (sSensLevel == SensLevel::Auto && sAutoIsVib));
       sCalibrateStartMs = millis();
       sCalibrateSum = 0;
       sCalibrateCount = 0;
@@ -351,54 +348,60 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   outDetected = false;
   static int16_t rawBuffer[Audio::kSamples];
 
-  bool useVib = (sSensLevel == SensLevel::Vib || sSensLevel == SensLevel::AutoVib || (sIsCalibrating && sNextAutoLevel == SensLevel::AutoVib));
+  bool useVib = (sSensLevel == SensLevel::Vib || (sSensLevel == SensLevel::Auto && sAutoIsVib) || (sIsCalibrating && sAutoIsVib));
 
   if (useVib) {
     unsigned long next_sample = micros();
-    for (int i = 0; i < Audio::kSamples; i++) {
-      if (i < 512) {
+    double vibMean = 0;
+    int actualSamples = 0;
+
+    for (int i = 0; i < 512; i++) {
         while (micros() - next_sample < 625) { /* busy wait */ }
         next_sample += 625;
         
         Wire1.beginTransmission(0x68);
         Wire1.write(0x0C);
         if (Wire1.endTransmission(false) != 0) {
-          // I2C 에러 발생 시 남은 버퍼를 0으로 채우고 탈출하여 UI 업데이트가 막히지 않게 함
-          for (int j = i; j < Audio::kSamples; j++) rawBuffer[j] = 0;
-          break;
+          break; // Stop collecting if I2C fails
         }
         if (Wire1.requestFrom(0x68, 6) == 6) {
           int16_t ax = Wire1.read() | (Wire1.read() << 8);
           int16_t ay = Wire1.read() | (Wire1.read() << 8);
           int16_t az = Wire1.read() | (Wire1.read() << 8);
           double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
-          rawBuffer[i] = (int16_t)(mag - 16384.0);
-        } else {
-          rawBuffer[i] = 0;
+          rawBuffer[actualSamples++] = (int16_t)mag;
+          vibMean += mag;
         }
-      } else {
-        // 나머지 샘플(1536개)은 0으로 채워 Zero-padding 처리. 
-        // 1.28초 블로킹을 320ms로 줄여 UI 먹통 현상 해결.
-        rawBuffer[i] = 0;
-      }
+    }
+    
+    if (actualSamples > 0) vibMean /= actualSamples;
+    
+    for (int i = 0; i < Audio::kSamples; i++) {
+       if (i < actualSamples) {
+           double val = (double)rawBuffer[i] - vibMean;
+           // Apply Hamming window only to collected samples
+           double ratio = (double)i / (actualSamples - 1);
+           double hamming = 0.54 - 0.46 * cos(2.0 * M_PI * ratio);
+           vReal[i] = val * hamming;
+       } else {
+           vReal[i] = 0; // Zero padding smoothly aligns with DC-removed signal
+       }
+       vImag[i] = 0;
     }
   } else {
     if (!M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
       return false;
     }
+    double mean = 0;
+    for (int i = 0; i < Audio::kSamples; i++) mean += rawBuffer[i];
+    mean /= Audio::kSamples;
+    for (int i = 0; i < Audio::kSamples; i++) {
+      vReal[i] = (double)rawBuffer[i] - mean;
+      vImag[i] = 0;
+    }
+    FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
   }
 
-  double mean = 0;
-  for (int i = 0; i < Audio::kSamples; i++) {
-    vReal[i] = (double)rawBuffer[i];
-    vImag[i] = 0;
-    mean += vReal[i];
-  }
-  mean /= Audio::kSamples;
-  for (int i = 0; i < Audio::kSamples; i++)
-    vReal[i] -= mean;
-
-  FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
   FFT.compute(FFT_FORWARD);
   FFT.complexToMagnitude();
 
@@ -426,15 +429,15 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
       sIsCalibrating = false;
       if (sCalibrateCount > 0) {
         double avg = sCalibrateSum / sCalibrateCount;
-        if (sNextAutoLevel == SensLevel::AutoVib) {
-           sAutoThresholdVib = avg * 0.4;
+        if (sAutoIsVib) {
+           sAutoThresholdVib = avg * 0.5;
            sAutoThresholdUpperVib = avg * 3.0;
         } else {
-           sAutoThresholdMic = avg * 0.4;
+           sAutoThresholdMic = avg * 0.5;
            sAutoThresholdUpperMic = avg * 3.0;
         }
       }
-      sSensLevel = sNextAutoLevel;
+      sSensLevel = SensLevel::Auto;
       sForceUiRefresh = true;
     }
   }

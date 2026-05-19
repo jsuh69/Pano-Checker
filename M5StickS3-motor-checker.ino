@@ -375,6 +375,14 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
           rawBuffer[actualSamples++] = (int16_t)mag;
           vibMean += mag;
         }
+
+        // 버튼 먹통 방지: 320ms 대기 중 중간중간 버튼 상태를 갱신하여 입력을 놓치지 않게 함
+        if (i > 0 && i % 128 == 0) {
+            M5.update();
+            handleButtons();
+            // M5.update() 실행에 소요된 시간(약 1~2ms)만큼 타이머를 보정하여 Burst 샘플링을 방지
+            next_sample = micros(); 
+        }
     }
     
     unsigned long end_time = micros();

@@ -360,16 +360,17 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
         while (micros() - next_sample < 625) { /* busy wait */ }
         next_sample += 625;
         
-        Wire.beginTransmission(0x68);
-        Wire.write(0x0C);
-        if (Wire.endTransmission(false) != 0) {
-          // I2C 에러 발생 시 즉시 탈출하여 100초간 먹통이 되는 현상 방지
-          return false;
+        Wire1.beginTransmission(0x68);
+        Wire1.write(0x0C);
+        if (Wire1.endTransmission(false) != 0) {
+          // I2C 에러 발생 시 남은 버퍼를 0으로 채우고 탈출하여 UI 업데이트가 막히지 않게 함
+          for (int j = i; j < Audio::kSamples; j++) rawBuffer[j] = 0;
+          break;
         }
-        if (Wire.requestFrom(0x68, 6) == 6) {
-          int16_t ax = Wire.read() | (Wire.read() << 8);
-          int16_t ay = Wire.read() | (Wire.read() << 8);
-          int16_t az = Wire.read() | (Wire.read() << 8);
+        if (Wire1.requestFrom(0x68, 6) == 6) {
+          int16_t ax = Wire1.read() | (Wire1.read() << 8);
+          int16_t ay = Wire1.read() | (Wire1.read() << 8);
+          int16_t az = Wire1.read() | (Wire1.read() << 8);
           double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
           rawBuffer[i] = (int16_t)(mag - 16384.0);
         } else {
@@ -579,18 +580,18 @@ void setup() {
   M5.Mic.config(mic_cfg);
   M5.Mic.begin();
 
-  // BMI270 Initialization
-  Wire.begin(47, 48, 400000); // SDA=47, SCL=48
-  Wire.setTimeOut(10);        // I2C 타임아웃을 10ms로 짧게 설정하여 먹통 방지
-  Wire.beginTransmission(0x68);
-  Wire.write(0x7D); // PWR_CTRL
-  Wire.write(0x04); // accel enable
-  Wire.endTransmission();
+  // BMI270 Initialization using Wire1 (Prevents conflict with PMIC on Wire)
+  Wire1.begin(47, 48, 400000); // SDA=47, SCL=48
+  Wire1.setTimeOut(10);        // I2C 타임아웃을 10ms로 짧게 설정하여 먹통 방지
+  Wire1.beginTransmission(0x68);
+  Wire1.write(0x7D); // PWR_CTRL
+  Wire1.write(0x04); // accel enable
+  Wire1.endTransmission();
   delay(10);
-  Wire.beginTransmission(0x68);
-  Wire.write(0x40); // ACC_CONF
-  Wire.write(0xAC); // 1600Hz ODR, normal
-  Wire.endTransmission();
+  Wire1.beginTransmission(0x68);
+  Wire1.write(0x40); // ACC_CONF
+  Wire1.write(0xAC); // 1600Hz ODR, normal
+  Wire1.endTransmission();
 
   // Serial.begin(115200);
 }

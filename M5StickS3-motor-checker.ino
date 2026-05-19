@@ -356,19 +356,28 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   if (useVib) {
     unsigned long next_sample = micros();
     for (int i = 0; i < Audio::kSamples; i++) {
-      while (micros() - next_sample < 625) { /* busy wait */ }
-      next_sample += 625;
-      
-      Wire.beginTransmission(0x68);
-      Wire.write(0x0C);
-      Wire.endTransmission(false);
-      if (Wire.requestFrom(0x68, 6) == 6) {
-        int16_t ax = Wire.read() | (Wire.read() << 8);
-        int16_t ay = Wire.read() | (Wire.read() << 8);
-        int16_t az = Wire.read() | (Wire.read() << 8);
-        double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
-        rawBuffer[i] = (int16_t)(mag - 16384.0);
+      if (i < 512) {
+        while (micros() - next_sample < 625) { /* busy wait */ }
+        next_sample += 625;
+        
+        Wire.beginTransmission(0x68);
+        Wire.write(0x0C);
+        if (Wire.endTransmission(false) != 0) {
+          // I2C 에러 발생 시 즉시 탈출하여 100초간 먹통이 되는 현상 방지
+          return false;
+        }
+        if (Wire.requestFrom(0x68, 6) == 6) {
+          int16_t ax = Wire.read() | (Wire.read() << 8);
+          int16_t ay = Wire.read() | (Wire.read() << 8);
+          int16_t az = Wire.read() | (Wire.read() << 8);
+          double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
+          rawBuffer[i] = (int16_t)(mag - 16384.0);
+        } else {
+          rawBuffer[i] = 0;
+        }
       } else {
+        // 나머지 샘플(1536개)은 0으로 채워 Zero-padding 처리. 
+        // 1.28초 블로킹을 320ms로 줄여 UI 먹통 현상 해결.
         rawBuffer[i] = 0;
       }
     }
@@ -572,6 +581,7 @@ void setup() {
 
   // BMI270 Initialization
   Wire.begin(47, 48, 400000); // SDA=47, SCL=48
+  Wire.setTimeOut(10);        // I2C 타임아웃을 10ms로 짧게 설정하여 먹통 방지
   Wire.beginTransmission(0x68);
   Wire.write(0x7D); // PWR_CTRL
   Wire.write(0x04); // accel enable

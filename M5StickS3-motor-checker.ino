@@ -348,10 +348,13 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   outDetected = false;
   static int16_t rawBuffer[Audio::kSamples];
 
+  static double sVibActualFs = 1600.0;
+
   bool useVib = (sSensLevel == SensLevel::Vib || (sSensLevel == SensLevel::Auto && sAutoIsVib) || (sIsCalibrating && sAutoIsVib));
 
   if (useVib) {
-    unsigned long next_sample = micros();
+    unsigned long start_time = micros();
+    unsigned long next_sample = start_time;
     double vibMean = 0;
     int actualSamples = 0;
 
@@ -374,7 +377,13 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
         }
     }
     
-    if (actualSamples > 0) vibMean /= actualSamples;
+    unsigned long end_time = micros();
+    
+    if (actualSamples > 0) {
+        vibMean /= actualSamples;
+        // 실제 I2C 속도나 지연으로 인해 샘플링 시간이 길어졌을 경우 실제 주파수를 정확히 역산함
+        sVibActualFs = (actualSamples * 1000000.0) / (double)(end_time - start_time);
+    }
     
     for (int i = 0; i < Audio::kSamples; i++) {
        if (i < actualSamples) {
@@ -405,7 +414,8 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   FFT.compute(FFT_FORWARD);
   FFT.complexToMagnitude();
 
-  double currentFs = useVib ? 1600.0 : Audio::kSamplingFrequency;
+  // 실제 측정된 샘플링 속도(sVibActualFs)를 적용하여 FFT 주파수를 정확히 계산
+  double currentFs = useVib ? sVibActualFs : Audio::kSamplingFrequency;
   int binLo = (150 * Audio::kSamples + (int)currentFs - 1) / (int)currentFs;
   int binHi = (750 * Audio::kSamples) / (int)currentFs;
 
@@ -585,6 +595,7 @@ void setup() {
 
   // BMI270 Initialization using Wire1 (Prevents conflict with PMIC on Wire)
   Wire1.begin(47, 48, 400000); // SDA=47, SCL=48
+  Wire1.setClock(400000);      // I2C 속도를 명시적으로 400kHz로 설정하여 I2C 지연을 방지함
   Wire1.setTimeOut(10);        // I2C 타임아웃을 10ms로 짧게 설정하여 먹통 방지
   Wire1.beginTransmission(0x68);
   Wire1.write(0x7D); // PWR_CTRL

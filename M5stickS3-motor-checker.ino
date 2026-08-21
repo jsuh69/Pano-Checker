@@ -17,11 +17,18 @@ static unsigned long sLastFuncExecutionMs = 0; // 센서/FFT/디스플레이 기
 // ==========================================
 // Constants & Settings
 // ==========================================
+namespace App {
+constexpr char kVersion[] = "0.7.0";
+} // namespace App
+
 namespace Audio {
 constexpr double kSamplingFrequency = 16000;
 constexpr uint16_t kSamples = 2048;
+constexpr uint16_t kVibSamples = 512;
 constexpr int kFftBandBinLo = (150 * (int)kSamples + 15999) / 16000;
 constexpr int kFftBandBinHi = (750 * (int)kSamples) / 16000;
+constexpr int kFftFirstUsableBin = 1;
+constexpr int kFftLastUsableBin = (kSamples / 2) - 2;
 constexpr double kMinValidRpmHz = 50.0;
 constexpr double kFftPeakRejectAbove = 4000000.0;
 } // namespace Audio
@@ -75,7 +82,7 @@ static char sCurrentPole = ' ';
 
 static bool sDisplayBlanked = false;
 static unsigned long sReadySinceMs = 0;
-static bool sShouldGoToSleep = false; 
+static bool sMicEnabled = false;
 
 enum class SensLevel : uint8_t { Low = 0, Mid, High, Vib, Auto };
 static SensLevel sSensLevel = SensLevel::High;
@@ -104,26 +111,10 @@ private:
 
 public:
   bool externalPowerOrCharging() {
-    // 💡 [핵심 교정] Plus2 전용 공식 M5Unified 함수를 사용합니다.
-    // getType()이 아닌, isCharging() 함수가 내부적으로 GPIO38 전압 변동을 읽어 판정합니다.
-    // 만약 라이브러리 상에서 오차가 있을 것에 대비해 두 가지 크로스 체크를 수행합니다.
-    
-    auto chg_stat = M5.Power.isCharging();
-    int mv = M5.Power.getBatteryVoltage(); // 현재 배터리 밀리볼트(mV) 취득
-
-    // 1) M5Unified 드라이버 레벨에서 충전 상태로 인지하거나
-    if (chg_stat == m5::Power_Class::is_charging) {
-      return true;
-    }
-
-    // 2) [하드웨어 직결 보완] USB가 꽂히면 충전 IC(TP4057)의 전류 밀어내기로 인해 
-    // 배터리 잔량이 76% 수준이더라도 전압 계측치가 일시적으로 평소 방전 전압보다 상승합니다.
-    // 일반적으로 USB 구동 시 측정 전압이 대략 3,850mV를 초과하여 유지됩니다.
-    if (mv > 3850) {
-      return true;
-    }
-
-    return false;
+    // Battery voltage alone is not evidence of USB power: a charged battery can
+    // stay above 3850 mV while unplugged. StickS3 exposes a charger-status pin
+    // through M5Unified, so use that authoritative signal instead.
+    return M5.Power.isCharging() == m5::Power_Class::is_charging;
   }
 
   void begin() {
@@ -180,6 +171,17 @@ void setBmi270Power(bool enable) {
 
 static void applyFixedBrightness() {
   M5.Display.setBrightness(PowerSave::kBrightnessFixed);
+}
+
+static void setMicrophonePower(bool enable) {
+  if (enable == sMicEnabled) return;
+
+  if (enable) {
+    M5.Mic.begin();
+  } else {
+    M5.Mic.end();
+  }
+  sMicEnabled = enable;
 }
 
 static void cycleSensitivity() {
@@ -273,6 +275,9 @@ void handleButtons() {
     
     if (sCurrentMode == AppMode::ModePano) {
       setBmi270Power(true);
+      setMicrophonePower(true);
+    } else {
+      setMicrophonePower(false);
     }
     sReadySinceMs = millis();
     sForceUiRefresh = true;
@@ -284,20 +289,20 @@ void handleButtons() {
     sCurrentMode = (sCurrentMode == AppMode::ModePano) ? AppMode::ModeMag : AppMode::ModePano;
     if (sCurrentMode == AppMode::ModeMag) {
       setBmi270Power(false); 
+      setMicrophonePower(false);
       startCalibration();
     } else {
       setBmi270Power(true);
+      setMicrophonePower(true);
     }
     sReadySinceMs = millis();
     sForceUiRefresh = true;
   }
 
   static bool sHasCalibratedThisPress = false;
-  static bool sWokeUpThisPressB = false;
 
   if (M5.BtnB.wasPressed()) {
     sHasCalibratedThisPress = false;
-    sWokeUpThisPressB = false;
     if (sCurrentMode == AppMode::ModeMag) {
       sHasCalibratedThisPress = true;
       startCalibration();
@@ -306,22 +311,20 @@ void handleButtons() {
     }
   }
 
-  if (!sWokeUpThisPressB) {
-    if (sCurrentMode == AppMode::ModePano && M5.BtnB.pressedFor(1000) && !sHasCalibratedThisPress) {
-      sHasCalibratedThisPress = true;
-      startCalibration();
+  if (sCurrentMode == AppMode::ModePano && M5.BtnB.pressedFor(1000) && !sHasCalibratedThisPress) {
+    sHasCalibratedThisPress = true;
+    startCalibration();
+    sReadySinceMs = millis();
+    sForceUiRefresh = true;
+  }
+
+  if (M5.BtnB.wasReleased()) {
+    if (!sHasCalibratedThisPress) {
+      if (sCurrentMode == AppMode::ModePano) {
+        cycleSensitivity();
+      }
       sReadySinceMs = millis();
       sForceUiRefresh = true;
-    }
-
-    if (M5.BtnB.wasReleased()) {
-      if (!sHasCalibratedThisPress) {
-        if (sCurrentMode == AppMode::ModePano) {
-          cycleSensitivity();
-        }
-        sReadySinceMs = millis();
-        sForceUiRefresh = true;
-      }
     }
   }
 }
@@ -387,7 +390,7 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     double vibMean = 0;
     int actualSamples = 0;
 
-    for (int i = 0; i < 512; i++) {
+    for (int i = 0; i < Audio::kVibSamples; i++) {
         while (micros() - next_sample < 625) { }
         next_sample += 625;
         
@@ -401,7 +404,8 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
           int16_t ay = Wire1.read() | (Wire1.read() << 8);
           int16_t az = Wire1.read() | (Wire1.read() << 8);
           double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
-          rawBuffer[actualSamples++] = (int16_t)mag;
+          // A three-axis magnitude can exceed int16_t; retain its full value.
+          vReal[actualSamples++] = mag;
           vibMean += mag;
         }
 
@@ -413,14 +417,16 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     }
     
     unsigned long end_time = micros();
-    if (actualSamples > 0) {
-        vibMean /= actualSamples;
-        sVibActualFs = (actualSamples * 1000000.0) / (double)(end_time - start_time);
+    const unsigned long elapsedUs = end_time - start_time;
+    if (actualSamples < 2 || elapsedUs == 0) {
+      return false;
     }
+    vibMean /= actualSamples;
+    sVibActualFs = (actualSamples * 1000000.0) / (double)elapsedUs;
     
     for (int i = 0; i < Audio::kSamples; i++) {
        if (i < actualSamples) {
-           double val = (double)rawBuffer[i] - vibMean;
+           double val = vReal[i] - vibMean;
            double ratio = (double)i / (actualSamples - 1);
            double hamming = 0.54 - 0.46 * cos(2.0 * M_PI * ratio);
            vReal[i] = val * hamming;
@@ -447,8 +453,12 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   FFT.complexToMagnitude();
 
   double currentFs = useVib ? sVibActualFs : Audio::kSamplingFrequency;
+  if (currentFs <= 0) return false;
   int binLo = (150 * Audio::kSamples + (int)currentFs - 1) / (int)currentFs;
   int binHi = (750 * Audio::kSamples) / (int)currentFs;
+  if (binLo < Audio::kFftFirstUsableBin) binLo = Audio::kFftFirstUsableBin;
+  if (binHi > Audio::kFftLastUsableBin) binHi = Audio::kFftLastUsableBin;
+  if (binLo > binHi) return false;
 
   double maxVal = 0;
   int peakIndex = 0;
@@ -503,7 +513,8 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     outDetected = false;
   }
 
-  if (outDetected && peakIndex >= binLo && peakIndex <= binHi) {
+  if (outDetected && peakIndex >= binLo && peakIndex <= binHi
+                  && peakIndex > 0 && peakIndex < (Audio::kSamples / 2) - 1) {
     double y0 = vReal[peakIndex - 1];
     double y1 = vReal[peakIndex];
     double y2 = vReal[peakIndex + 1];
@@ -529,6 +540,7 @@ void updatePowerSaveState(bool active) {
       
       // 1. 센서 최소 전력 모드 유도
       setBmi270Power(false); 
+      setMicrophonePower(false);
 
       // 2. 디스플레이를 완벽하게 물리적 슬립으로 전환 (소모 전류 극소화)
       M5.Display.setBrightness(0);
@@ -651,11 +663,10 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
 
-  // ❌ [기존 오동작 유발 코드 전면 삭제]
-  // M5.Power.setChargeCurrent(600); -> 삭제
-  // M5.Power.setChargeVoltage(4200); -> 삭제
-  // M5.Power.setBatteryCharge(true); -> 삭제
-  // #if defined(LGFX_M5STACK_M5STIC_C) || true 블록 전체 -> 삭제
+  // Explicitly keep the StickS3 charger enabled while the firmware is active.
+  // Charge current and voltage are board-hardware controlled, so do not apply
+  // values intended for a different PMIC.
+  M5.Power.setBatteryCharge(true);
 
   delay(200);
   
@@ -685,6 +696,7 @@ void setup() {
   mic_cfg.pin_ws = 15;
   M5.Mic.config(mic_cfg);
   M5.Mic.begin();
+  sMicEnabled = true;
 
   Wire1.begin(47, 48, 400000); 
   Wire1.setClock(400000);      
@@ -755,3 +767,4 @@ void loop() {
 
   delay(50); 
 }
+

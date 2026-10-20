@@ -1,7 +1,10 @@
 #include <M5Unified.h>
 #include <arduinoFFT.h>
 #include <cmath>
-#include <Wire.h>
+#include "AppLogic.h"
+#include <esp_timer.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #if defined(ESP32)
 #include <WiFi.h>
 #include <esp_bt.h>
@@ -18,7 +21,7 @@ static unsigned long sLastFuncExecutionMs = 0; // 센서/FFT/디스플레이 기
 // Constants & Settings
 // ==========================================
 namespace App {
-constexpr char kVersion[] = "0.8.0";
+constexpr char kVersion[] = "0.9.1";
 } // namespace App
 
 namespace Audio {
@@ -45,19 +48,27 @@ constexpr unsigned long kAnalysisIntervalMs = 500;
 } // namespace Audio
 
 namespace PowerSave {
-constexpr uint8_t kBrightnessFixed = 25;
-constexpr unsigned long kDisplayBlankAfterReadyMs = 20000; 
+constexpr uint8_t kBrightnessActive = 25;
+constexpr uint8_t kBrightnessDim = 3;
 constexpr unsigned long kUiRefreshActiveMs = 500;
-constexpr unsigned long kUiRefreshIdleMs = 700;
-constexpr uint8_t kCpuFreqActiveMhz = 80; 
+constexpr unsigned long kUiRefreshIdleMs = 1000;
+constexpr uint8_t kCpuFreqActiveMhz = 80;
+constexpr unsigned long kStoppedButtonPollMs = 50;
+constexpr unsigned long kStoppedLoopDelayMs = 25;
+constexpr uint64_t kSleepPollUs = 2000000; // Check USB/charger every two seconds.
+// StickS3 front and upper buttons (M5Unified board pin mapping).
+constexpr gpio_num_t kFrontButton = GPIO_NUM_11;
+constexpr gpio_num_t kModeButton = GPIO_NUM_12;
 } // namespace PowerSave
 
 namespace BatConfig {
 constexpr int16_t kVbusPresentMinMv = 4200;
-constexpr int32_t kVoltMaxUnplugged = 4150; 
-constexpr int32_t kVoltMaxCharging  = 4230; 
-constexpr int32_t kVoltMin          = 3400; 
 } // namespace BatConfig
+
+namespace Diagnostics {
+constexpr bool kPowerLogEnabled = true;
+constexpr unsigned long kPowerLogIntervalMs = 30000;
+} // namespace Diagnostics
 
 namespace UI {
 constexpr uint16_t COLOR_BG = 0x0000;
@@ -74,16 +85,26 @@ constexpr uint16_t COLOR_READY = 0x7BEF;
 // ==========================================
 // Global State & Objects
 // ==========================================
-double vReal[Audio::kSamples];
-double vImag[Audio::kSamples];
-ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, Audio::kSamples, Audio::kSamplingFrequency);
+// ESP32-S3 has a single-precision FPU. Avoid software double arithmetic in FFT.
+float vReal[Audio::kSamples];
+float vImag[Audio::kSamples];
+ArduinoFFT<float> FFT(vReal, vImag, Audio::kSamples, Audio::kSamplingFrequency);
+static float sMicWindow[Audio::kSamples / 2];
+static float sVibWindow[Audio::kVibSamples / 2];
+
+static void prepareWindows() {
+  for (int i = 0; i < Audio::kSamples / 2; ++i)
+    sMicWindow[i] = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * i / (Audio::kSamples - 1));
+  for (int i = 0; i < Audio::kVibSamples / 2; ++i)
+    sVibWindow[i] = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * i / (Audio::kVibSamples - 1));
+}
 
 LGFX_Sprite spr(&M5.Display);
 
 double lastHz = 0;
 bool sForceUiRefresh = false;
 
-enum class AppMode : uint8_t { ModePano, ModeMag };
+enum class AppMode : uint8_t { ModePano, ModeMag, ModeStopwatch };
 static AppMode sCurrentMode = AppMode::ModePano;
 
 constexpr int kMagPin = 1;
@@ -92,7 +113,39 @@ static double sCurrentGauss = 0;
 static char sCurrentPole = ' ';  
 
 static bool sDisplayBlanked = false;
-static unsigned long sReadySinceMs = 0;
+static uint64_t sLastActivityMs = 0;
+static uint8_t sBrightness = PowerSave::kBrightnessActive;
+static uint32_t sMeasurementGeneration = 0;
+static bool sConsumeButtonsUntilRelease = false;
+static bool sSensorError = false;
+// Assume enabled until setup has explicitly powered down the IMU.
+static bool sBmiEnabled = true;
+static bool sBmiPresent = false;
+static bool sHasTrackedPeak = false;
+static double sTrackedPeakHz = 0;
+static uint8_t sTrackedPeakFrames = 0;
+static unsigned long sSignalContinuousStartMs = 0;
+static bool sSignalContinuous = false;
+static double sLastInstGauss = 0;
+static double sCurrentHz = 0;
+static bool sDetected = false;
+static bool sRpmActive = false;
+static bool sMagActive = false;
+static Stopwatch sStopwatch;
+static FrontButtonGesture sFrontGesture;
+static uint64_t sFrontPressedMs = 0;
+static uint64_t monotonicMs() { return esp_timer_get_time() / 1000ULL; }
+
+static void resetDetection() {
+  sHasTrackedPeak = false;
+  sTrackedPeakHz = 0;
+  sTrackedPeakFrames = 0;
+  sSignalContinuous = false;
+  sSignalContinuousStartMs = 0;
+  sCurrentHz = 0;
+  sDetected = sRpmActive = sMagActive = false;
+  lastHz = 0;
+}
 static bool sMicEnabled = false;
 
 enum class SensLevel : uint8_t { Low = 0, Mid, High, Vib, Auto };
@@ -125,7 +178,7 @@ private:
   uint8_t percentSampleCount = 0;
   uint8_t nextPercentSample = 0;
 
-  static constexpr uint32_t kCheckIntervalMs = 1000;
+  static constexpr uint32_t kCheckIntervalMs = 2000;
   static constexpr uint32_t kChargerEnableRefreshMs = 10000;
   static constexpr uint8_t kChargingConfirmationsNeeded = 3;
 
@@ -180,6 +233,12 @@ public:
         M5.Power.setBatteryCharge(true);
         lastChargerEnableMs = currentMs;
       }
+      // USB presence takes effect on the first positive reading so the display
+      // stays on. Debounce removal to tolerate charge-status transients.
+      if (sampledCharging && !uiCharging) {
+        uiCharging = true;
+        sForceUiRefresh = true;
+      }
       if (sampledCharging != pendingCharging) {
         pendingCharging = sampledCharging;
         chargingConfirmations = 1;
@@ -188,7 +247,7 @@ public:
       }
 
       // The PMIC charging-status pin can briefly change while USB power is
-      // applied.  Only update the bolt after three matching samples.
+      // applied. Confirm cable removal with three matching samples.
       if (chargingConfirmations >= kChargingConfirmationsNeeded
           && pendingCharging != uiCharging) {
         uiCharging = pendingCharging;
@@ -222,30 +281,87 @@ public:
   }
 
   int getBatteryPercent() const { return stableBatPct; }
-  bool isCharging() const { return uiCharging; } 
+  bool hasExternalPower() const { return uiCharging; }
 };
 
 BatteryManager batteryManager; 
+
+static void logPowerDiagnostics() {
+  static unsigned long lastLogMs = 0;
+  static char line[192];
+  static size_t pending = 0, offset = 0;
+  // No extra sensor/bus work when a serial monitor is not attached.
+  if (!Diagnostics::kPowerLogEnabled || !Serial) {
+    pending = offset = 0;
+    return;
+  }
+  const unsigned long now = millis();
+  if (pending == 0 && now - lastLogMs >= Diagnostics::kPowerLogIntervalMs) {
+    lastLogMs = now;
+    if (Serial.availableForWrite() <= 0) return;
+    uint8_t powerConfig = 0, gpioInputs = 0, imuPower = 0;
+    const bool configOk = M5.In_I2C.readRegister(0x6E, 0x06, &powerConfig, 1, 100000);
+    const bool gpioOk = M5.In_I2C.readRegister(0x6E, 0x12, &gpioInputs, 1, 100000);
+    const bool imuOk = sBmiPresent && M5.In_I2C.readRegister(0x68, 0x7D, &imuPower, 1, 400000);
+    const int length = snprintf(line, sizeof(line),
+        "PWR usb=%u vin=%d bat=%d pct=%d chg=%d en=%d boost=%d imu=%d mic=%u watch=%u\n",
+        (unsigned)batteryManager.hasExternalPower(), (int)M5.Power.getVBUSVoltage(),
+        (int)M5.Power.getBatteryVoltage(), batteryManager.getBatteryPercent(),
+        gpioOk ? ((gpioInputs & 1) ? 0 : 1) : -1,
+        configOk ? ((powerConfig & 1) ? 1 : 0) : -1,
+        configOk ? ((powerConfig & 8) ? 1 : 0) : -1,
+        imuOk ? (int)imuPower : -1, (unsigned)M5.Mic.isRunning(),
+        (unsigned)sStopwatch.running());
+    if (length > 0 && length < (int)sizeof(line)) {
+      pending = (size_t)length;
+      offset = 0;
+    }
+  }
+  // Drain only currently available TX space, including on 64-byte USB FIFOs.
+  // Never wait for the monitor to consume a message.
+  const int available = Serial.availableForWrite();
+  if (pending > 0 && available > 0) {
+    const size_t chunk = pending < (size_t)available ? pending : (size_t)available;
+    const size_t written = Serial.write(reinterpret_cast<const uint8_t*>(line + offset), chunk);
+    pending -= written;
+    offset += written;
+  }
+}
 
 // ==========================================
 // Helper Functions
 // ==========================================
 void setBmi270Power(bool enable) {
-  Wire1.beginTransmission(0x68);
-  Wire1.write(0x7D); 
-  Wire1.write(enable ? 0x04 : 0x00); 
-  Wire1.endTransmission();
+  if (enable == sBmiEnabled) return;
+  if ((enable && !sBmiPresent)
+      || !M5.In_I2C.writeRegister8(0x68, 0x7D, enable ? 0x04 : 0x00, 400000)) {
+    sSensorError = true;
+    sForceUiRefresh = true;
+    return;
+  }
+  sBmiEnabled = enable;
 }
 
-static void applyFixedBrightness() {
-  M5.Display.setBrightness(PowerSave::kBrightnessFixed);
+static void applyBrightness(uint8_t brightness) {
+  if (sBrightness == brightness) return;
+  sBrightness = brightness;
+  M5.Display.setBrightness(brightness);
+}
+
+static void noteActivity() {
+  sLastActivityMs = monotonicMs();
+  if (!sDisplayBlanked) applyBrightness(PowerSave::kBrightnessActive);
 }
 
 static void setMicrophonePower(bool enable) {
   if (enable == sMicEnabled) return;
 
   if (enable) {
-    M5.Mic.begin();
+    if (!M5.Mic.begin()) {
+      sSensorError = true;
+      sForceUiRefresh = true;
+      return;
+    }
   } else {
     M5.Mic.end();
   }
@@ -263,10 +379,15 @@ static bool isVibrationSensorSelected() {
 static void syncPanoSensorPower() {
   const bool useVibrationSensor = isVibrationSensorSelected();
   setBmi270Power(useVibrationSensor);
-  setMicrophonePower(!useVibrationSensor);
+  // Microphone runs only while capturing a frame, not between analyses.
+  if (useVibrationSensor) setMicrophonePower(false);
 }
 
 static void cycleSensitivity() {
+  ++sMeasurementGeneration;
+  sIsCalibrating = false;
+  sSensorError = false;
+  resetDetection();
   switch (sSensLevel) {
     case SensLevel::Low:     sSensLevel = SensLevel::Mid; break;
     case SensLevel::Mid:     sSensLevel = SensLevel::High; break;
@@ -280,9 +401,6 @@ static void cycleSensitivity() {
 }
 
 static double sensitivityThreshold() {
-  if (sSensLevel == SensLevel::Auto) {
-    return sAutoIsVib ? sAutoThresholdVib : sAutoThresholdMic;
-  }
   switch (sSensLevel) {
     // Microphone sensitivity is determined primarily by peak-to-noise ratio,
     // not a fixed room-dependent FFT magnitude.
@@ -290,6 +408,7 @@ static double sensitivityThreshold() {
     case SensLevel::Mid:
     case SensLevel::High: return Audio::kMicMinimumPeakMagnitude;
     case SensLevel::Vib: return 5000.0;
+    case SensLevel::Auto: return sAutoIsVib ? sAutoThresholdVib : sAutoThresholdMic;
   }
   return Audio::kMicMinimumPeakMagnitude;
 }
@@ -326,12 +445,12 @@ static double sensitivityThresholdUpper() {
 }
 
 static const char *sensitivityLabel() {
-  if (sSensLevel == SensLevel::Auto) return "AUTO";
   switch (sSensLevel) {
     case SensLevel::Low: return "LOW";
     case SensLevel::Mid: return "MID";
     case SensLevel::High: return "HIGH";
     case SensLevel::Vib: return "VIB";
+    case SensLevel::Auto: return "AUTO";
   }
   return "";
 }
@@ -364,6 +483,9 @@ String formatNumber(long n) {
 // Core Logic Functions
 // ==========================================
 void startCalibration() {
+  ++sMeasurementGeneration;
+  resetDetection();
+  sSensorError = false;
   sIsCalibrating = true;
   sCalibrateStartMs = millis();
   sCalibrateSum = 0;
@@ -374,71 +496,73 @@ void startCalibration() {
   }
 }
 
-void handleButtons() {
-  if (sDisplayBlanked && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
-    // ⚡ 깨어날 때 가장 먼저 CPU 속도부터 정상화합니다.
-    setCpuFrequencyMhz(PowerSave::kCpuFreqActiveMhz); 
-    
-    sDisplayBlanked = false;
-    
-    M5.Display.wakeup(); 
-    applyFixedBrightness();
-    
-    if (sCurrentMode == AppMode::ModePano) {
-      syncPanoSensorPower();
-    } else {
-      setMicrophonePower(false);
-    }
-    sReadySinceMs = millis();
-    sForceUiRefresh = true;
-    return;
-  }
-
-  // 기존 BtnA, BtnB 제어 로직 유지
-  if (M5.BtnA.wasPressed()) {
-    sCurrentMode = (sCurrentMode == AppMode::ModePano) ? AppMode::ModeMag : AppMode::ModePano;
-    if (sCurrentMode == AppMode::ModeMag) {
-      setBmi270Power(false); 
-      setMicrophonePower(false);
-      startCalibration();
-    } else {
-      syncPanoSensorPower();
-    }
-    sReadySinceMs = millis();
-    sForceUiRefresh = true;
-  }
-
-  static bool sHasCalibratedThisPress = false;
-
-  if (M5.BtnB.wasPressed()) {
-    sHasCalibratedThisPress = false;
-    if (sCurrentMode == AppMode::ModeMag) {
-      sHasCalibratedThisPress = true;
-      startCalibration();
-      sReadySinceMs = millis();
-      sForceUiRefresh = true;
-    }
-  }
-
-  if (sCurrentMode == AppMode::ModePano && M5.BtnB.pressedFor(1000) && !sHasCalibratedThisPress) {
-    sHasCalibratedThisPress = true;
-    startCalibration();
-    sReadySinceMs = millis();
-    sForceUiRefresh = true;
-  }
-
-  if (M5.BtnB.wasReleased()) {
-    if (!sHasCalibratedThisPress) {
-      if (sCurrentMode == AppMode::ModePano) {
-        cycleSensitivity();
-      }
-      sReadySinceMs = millis();
-      sForceUiRefresh = true;
-    }
-  }
+static void wakeDisplay() {
+  sDisplayBlanked = false;
+  M5.Display.wakeup();
+  applyBrightness(PowerSave::kBrightnessActive);
+  resetDetection();
+  if (sCurrentMode == AppMode::ModePano) syncPanoSensorPower();
+  noteActivity();
+  sForceUiRefresh = true;
 }
 
-static double sLastInstGauss = 0.0;
+static void changeMode() {
+  ++sMeasurementGeneration;
+  sIsCalibrating = false;
+  sCalibrateSum = 0;
+  sCalibrateCount = 0;
+  resetDetection();
+  sSensorError = false;
+  setMicrophonePower(false);
+  setBmi270Power(false);
+  switch (sCurrentMode) {
+    case AppMode::ModePano: sCurrentMode = AppMode::ModeMag; break;
+    case AppMode::ModeMag: sCurrentMode = AppMode::ModeStopwatch; break;
+    case AppMode::ModeStopwatch: sCurrentMode = AppMode::ModePano; break;
+  }
+  if (sCurrentMode == AppMode::ModeMag) startCalibration();
+  if (sCurrentMode == AppMode::ModePano) syncPanoSensorPower();
+  // A held front button must never act on the newly selected mode.
+  sConsumeButtonsUntilRelease = true;
+  sFrontGesture.cancel();
+  noteActivity();
+  sForceUiRefresh = true;
+}
+
+void handleButtons() {
+  if (sConsumeButtonsUntilRelease) {
+    sFrontGesture.cancel();
+    if (M5.BtnA.isReleased() && M5.BtnB.isReleased()) {
+      sConsumeButtonsUntilRelease = false;
+    }
+    return;
+  }
+  if (sDisplayBlanked && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
+    wakeDisplay();
+    sConsumeButtonsUntilRelease = true;
+    return;
+  }
+  if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) noteActivity();
+  if (M5.BtnB.wasPressed()) {
+    changeMode();
+    return;
+  }
+  if (M5.BtnA.wasPressed()) sFrontPressedMs = monotonicMs();
+  const FrontAction action = sFrontGesture.update(M5.BtnA.wasPressed(),
+      M5.BtnA.wasReleased(), M5.BtnA.pressedFor(1000));
+  if (action == FrontAction::LongPress) {
+    if (sCurrentMode == AppMode::ModeStopwatch) sStopwatch.reset();
+    else startCalibration();
+    noteActivity();
+    sForceUiRefresh = true;
+  } else if (action == FrontAction::ShortPress) {
+    if (sCurrentMode == AppMode::ModePano) cycleSensitivity();
+    else if (sCurrentMode == AppMode::ModeMag) startCalibration();
+    else sStopwatch.toggle(sFrontPressedMs); // Timestamp the press, not its release.
+    noteActivity();
+    sForceUiRefresh = true;
+  }
+}
 
 bool processMagnetic(bool &magActive) {
   magActive = false;
@@ -455,6 +579,8 @@ bool processMagnetic(bool &magActive) {
       sIsCalibrating = false;
       if (sCalibrateCount > 0) {
         sMagBaseline = sCalibrateSum / sCalibrateCount;
+        sLastInstGauss = sCurrentGauss = 0;
+        sCurrentPole = ' ';
       }
       sForceUiRefresh = true;
     }
@@ -490,44 +616,43 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   outDetected = false;
   static int16_t rawBuffer[Audio::kSamples];
   static double sVibActualFs = 1600.0;
+  const uint32_t generation = sMeasurementGeneration;
 
   bool useVib = (sSensLevel == SensLevel::Vib || (sSensLevel == SensLevel::Auto && sAutoIsVib) || (sIsCalibrating && sAutoIsVib));
 
   if (useVib) {
+    if (!sBmiPresent || !sBmiEnabled) return false;
     unsigned long start_time = micros();
     unsigned long next_sample = start_time;
-    double vibMean = 0;
+    float vibMean = 0;
     int actualSamples = 0;
 
     for (int i = 0; i < Audio::kVibSamples; i++) {
         while (micros() - next_sample < 625) { }
         next_sample += 625;
         
-        Wire1.beginTransmission(0x68);
-        Wire1.write(0x0C);
-        if (Wire1.endTransmission(false) != 0) {
-          break; 
+        uint8_t bytes[6];
+        if (!M5.In_I2C.readRegister(0x68, 0x0C, bytes, sizeof(bytes), 400000)) {
+          return false; // Discard incomplete frames instead of analysing bad data.
         }
-        if (Wire1.requestFrom(0x68, 6) == 6) {
-          int16_t ax = Wire1.read() | (Wire1.read() << 8);
-          int16_t ay = Wire1.read() | (Wire1.read() << 8);
-          int16_t az = Wire1.read() | (Wire1.read() << 8);
-          double mag = sqrt((double)ax * ax + (double)ay * ay + (double)az * az);
-          // A three-axis magnitude can exceed int16_t; retain its full value.
-          vReal[actualSamples++] = mag;
-          vibMean += mag;
-        }
+        int16_t ax = (int16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
+        int16_t ay = (int16_t)((uint16_t)bytes[2] | ((uint16_t)bytes[3] << 8));
+        int16_t az = (int16_t)((uint16_t)bytes[4] | ((uint16_t)bytes[5] << 8));
+        float mag = sqrtf((float)ax * ax + (float)ay * ay + (float)az * az);
+        vReal[actualSamples++] = mag;
+        vibMean += mag;
 
         if (i > 0 && i % 128 == 0) {
             M5.update();
             handleButtons();
+            if (generation != sMeasurementGeneration) return false;
             next_sample = micros(); 
         }
     }
     
     unsigned long end_time = micros();
     const unsigned long elapsedUs = end_time - start_time;
-    if (actualSamples < 2 || elapsedUs == 0) {
+    if (actualSamples != Audio::kVibSamples || elapsedUs == 0) {
       return false;
     }
     vibMean /= actualSamples;
@@ -535,27 +660,39 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     
     for (int i = 0; i < Audio::kSamples; i++) {
        if (i < actualSamples) {
-           double val = vReal[i] - vibMean;
-           double ratio = (double)i / (actualSamples - 1);
-           double hamming = 0.54 - 0.46 * cos(2.0 * M_PI * ratio);
-           vReal[i] = val * hamming;
+           const int wi = i < actualSamples / 2 ? i : actualSamples - 1 - i;
+           vReal[i] = (vReal[i] - vibMean) * sVibWindow[wi];
        } else {
            vReal[i] = 0; 
        }
        vImag[i] = 0;
     }
   } else {
-    if (!M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
+    setMicrophonePower(true);
+    if (!sMicEnabled || !M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
+      setMicrophonePower(false);
       return false;
     }
-    double mean = 0;
+    // record() queues capture. Do not touch rawBuffer until the producer finishes.
+    const uint64_t captureStartedMs = monotonicMs();
+    while (M5.Mic.isRecording()) {
+      delay(5); // Yield instead of spinning while the I2S task captures samples.
+      M5.update();
+      handleButtons();
+      if (generation != sMeasurementGeneration || monotonicMs() - captureStartedMs > 500) {
+        setMicrophonePower(false); // end() also joins/cancels the writer.
+        return false;
+      }
+    }
+    setMicrophonePower(false);
+    float mean = 0;
     for (int i = 0; i < Audio::kSamples; i++) mean += rawBuffer[i];
     mean /= Audio::kSamples;
     for (int i = 0; i < Audio::kSamples; i++) {
-      vReal[i] = (double)rawBuffer[i] - mean;
+      const int wi = i < Audio::kSamples / 2 ? i : Audio::kSamples - 1 - i;
+      vReal[i] = ((float)rawBuffer[i] - mean) * sMicWindow[wi];
       vImag[i] = 0;
     }
-    FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
   }
 
   FFT.compute(FFT_FORWARD);
@@ -582,7 +719,7 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
 
   // Use a robust local noise floor, not the absolute loudness of the room.
   // The fixed array is sufficient for the 350–650 Hz microphone reference
-  // band at 16 kHz / 2048 samples (about 39 FFT bins).
+  // band at 8 kHz / 1024 samples (about 39 FFT bins).
   double peakToNoiseDb = 0.0;
   if (!useVib && peakIndex > 0) {
     int referenceBinLo = (Audio::kMicReferenceBandLoHz * Audio::kSamples
@@ -669,9 +806,6 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
                       && peakHz <= Audio::kMicTargetBandHiHz
                       && peakToNoiseDb >= sensitivityRequiredSnrDb();
 
-    static bool sHasTrackedPeak = false;
-    static double sTrackedPeakHz = 0.0;
-    static uint8_t sTrackedPeakFrames = 0;
 
     if (isInstantDetected) {
       if (sHasTrackedPeak && fabs(peakHz - sTrackedPeakHz) <= Audio::kTrackedFrequencyToleranceHz) {
@@ -693,8 +827,6 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   } else {
     // Preserve the vibration-sensor behaviour: its spectral characteristics
     // are different from the airborne microphone signal.
-    static unsigned long sSignalContinuousStartMs = 0;
-    static bool sSignalContinuous = false;
     if (isInstantDetected) {
       if (!sSignalContinuous) {
         sSignalContinuous = true;
@@ -711,29 +843,61 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
 }
 
 void updatePowerSaveState(bool active) {
-  if (active) {
-    sReadySinceMs = 0;
-  } else {
-    if (sReadySinceMs == 0) sReadySinceMs = millis();
-      
-    if (!sDisplayBlanked && (millis() - sReadySinceMs >= PowerSave::kDisplayBlankAfterReadyMs)) {
-      sDisplayBlanked = true;
-      
-      // 1. 센서 최소 전력 모드 유도
-      setBmi270Power(false); 
-      setMicrophonePower(false);
-
-      // 2. 디스플레이를 완벽하게 물리적 슬립으로 전환 (소모 전류 극소화)
-      M5.Display.setBrightness(0);
-      M5.Display.sleep(); 
-
-      // ⚡ [핵심 치트키] CPU 클록을 10MHz로 떨어뜨려 내부 소모 전력을 제로에 가깝게 만듭니다.
-      // 이렇게 하면 VBUS 전압이 4.9V 이상으로 복구되어 충전 IC가 최고 속도로 배터리를 채웁니다.
-      setCpuFrequencyMhz(10); 
-
-      Serial.println("💤 초절전 하드웨어 충전 모드 진입 (CPU 10MHz 제한)");
-    }
+  if (active) noteActivity();
+  const DisplayPower desired = displayPowerFor(monotonicMs() - sLastActivityMs,
+      batteryManager.hasExternalPower(), sCurrentMode == AppMode::ModeStopwatch, sIsCalibrating);
+  if (desired != DisplayPower::Off) {
+    if (sDisplayBlanked) wakeDisplay();
+    applyBrightness(desired == DisplayPower::Bright
+        ? PowerSave::kBrightnessActive : PowerSave::kBrightnessDim);
+    return;
   }
+  if (sDisplayBlanked) return;
+  ++sMeasurementGeneration;
+  resetDetection();
+  setMicrophonePower(false);
+  setBmi270Power(false);
+  sDisplayBlanked = true;
+  applyBrightness(0);
+  M5.Display.sleep();
+}
+
+static void sleepWhileBlanked() {
+  // No low-frequency polling loop: light sleep preserves RAM and stopwatch time.
+  // USB detection/charge maintenance still run on the periodic timer wakeups.
+  setBmi270Power(false); // Retry a failed power-down on timer wakeups.
+  if (digitalRead(PowerSave::kFrontButton) == LOW || digitalRead(PowerSave::kModeButton) == LOW) {
+    wakeDisplay();
+    sConsumeButtonsUntilRelease = true;
+    return;
+  }
+  const bool gpioReady = gpio_wakeup_enable(PowerSave::kFrontButton, GPIO_INTR_LOW_LEVEL) == ESP_OK
+      && gpio_wakeup_enable(PowerSave::kModeButton, GPIO_INTR_LOW_LEVEL) == ESP_OK
+      && esp_sleep_enable_gpio_wakeup() == ESP_OK;
+  if (!gpioReady) {
+    gpio_wakeup_disable(PowerSave::kFrontButton);
+    gpio_wakeup_disable(PowerSave::kModeButton);
+    delay(30); // Keep button polling functional if wake source setup fails.
+    return;
+  }
+  if (esp_sleep_enable_timer_wakeup(PowerSave::kSleepPollUs) != ESP_OK) {
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+    gpio_wakeup_disable(PowerSave::kFrontButton);
+    gpio_wakeup_disable(PowerSave::kModeButton);
+    delay(30);
+    return;
+  }
+  const esp_err_t result = esp_light_sleep_start();
+  const bool buttonWake = result == ESP_OK && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  gpio_wakeup_disable(PowerSave::kFrontButton);
+  gpio_wakeup_disable(PowerSave::kModeButton);
+  if (buttonWake) {
+    wakeDisplay();
+    sConsumeButtonsUntilRelease = true;
+  }
+  if (result != ESP_OK) delay(30);
 }
 
 // ==========================================
@@ -744,23 +908,23 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
 
   static unsigned long lastUpdate = 0;
   bool isAnyDetected = (sCurrentMode == AppMode::ModePano) ? isDetected : magActive;
-  const unsigned long uiPeriod = isAnyDetected ? PowerSave::kUiRefreshActiveMs : PowerSave::kUiRefreshIdleMs;
+  const unsigned long uiPeriod = sCurrentMode == AppMode::ModeStopwatch && sStopwatch.running()
+      ? 100 : (isAnyDetected ? PowerSave::kUiRefreshActiveMs : PowerSave::kUiRefreshIdleMs);
+  // A stationary screen is redrawn only on state/value changes.
+  const bool changing = (sCurrentMode == AppMode::ModeStopwatch && sStopwatch.running())
+      || isAnyDetected || sIsCalibrating;
 
-  if (sForceUiRefresh || millis() - lastUpdate >= uiPeriod) {
+  if (sForceUiRefresh || (changing && millis() - lastUpdate >= uiPeriod)) {
     sForceUiRefresh = false;
     lastUpdate = millis();
 
     spr.fillScreen(UI::COLOR_BG);
-    spr.setFont(&fonts::FreeSans12pt7b);
     spr.setTextColor(UI::COLOR_TEXT);
-    spr.setCursor(5, 12);
-
-    if (sCurrentMode == AppMode::ModePano) {
-      double displayHz = isDetected ? currentHz : lastHz;
-      if (displayHz > 0) {
-        spr.printf("%.1f Hz", displayHz);
-      }
-    }
+    spr.setFont(&fonts::FreeSans9pt7b);
+    spr.setTextDatum(top_left);
+    const char* modeLabel = sCurrentMode == AppMode::ModePano ? "PANO"
+        : (sCurrentMode == AppMode::ModeMag ? "MAGNETIC" : "STOPWATCH");
+    spr.drawString(modeLabel, 5, 7);
 
     // ── Battery status: stable number plus a charging battery icon ──
     spr.setFont(&fonts::FreeSans9pt7b);
@@ -770,7 +934,7 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
     spr.setTextColor(UI::COLOR_TEXT);
     spr.drawRightString(batteryText, batteryTextRight, 12);
 
-    if (batteryManager.isCharging()) {
+    if (batteryManager.hasExternalPower()) {
       // 16 x 22 px plug-in-battery icon, following the supplied reference.
       const int iconX = batteryTextRight - batteryTextWidth - 20;
       const int iconY = 7; // three pixels lower than the previous battery icon
@@ -790,11 +954,23 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
       spr.setFont(&fonts::FreeSans9pt7b);
       spr.setTextDatum(top_right);
       spr.drawString(sensitivityLabel(), spr.width() - 5, 30);
+      if (lastHz > 0) {
+        char hzBuf[24];
+        snprintf(hzBuf, sizeof(hzBuf), "%.1f Hz", lastHz);
+        spr.setTextDatum(top_left);
+        spr.setTextColor(UI::COLOR_TEXT);
+        spr.drawString(hzBuf, 5, 30);
+      }
     }
 
     spr.setTextDatum(top_center);
     
-    if (sIsCalibrating) {
+    if (sSensorError) {
+      spr.setTextColor(UI::COLOR_BAT_LOW);
+      spr.setFont(&fonts::FreeSans12pt7b);
+      spr.drawString("SENSOR ERROR", spr.width() / 2, 65);
+    }
+    else if (sIsCalibrating) {
       if (sCurrentMode == AppMode::ModeMag) {
         spr.setTextColor(UI::COLOR_MAG_VALUE);
       } else {
@@ -803,6 +979,21 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
       spr.setFont(&fonts::FreeSans12pt7b);
       spr.drawString("CALIBRATING", spr.width() / 2, 65);
     } 
+    else if (sCurrentMode == AppMode::ModeStopwatch) {
+      const uint64_t elapsed = sStopwatch.elapsedMs(monotonicMs());
+      const unsigned long hours = (unsigned long)(elapsed / 3600000ULL);
+      char timeBuf[32];
+      snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02u:%02u.%02u", hours,
+          (unsigned)((elapsed / 60000) % 60), (unsigned)((elapsed / 1000) % 60),
+          (unsigned)((elapsed / 10) % 100));
+      spr.setFont(&fonts::FreeSans18pt7b);
+      spr.setTextColor(UI::COLOR_MAG_VALUE);
+      spr.drawString(timeBuf, spr.width() / 2, 43);
+      spr.setFont(&fonts::FreeSans9pt7b);
+      spr.setTextColor(UI::COLOR_TEXT);
+      spr.drawString(sStopwatch.running() ? "RUNNING" : "STOPPED", spr.width() / 2, 89);
+      spr.drawString("Hold front: RESET", spr.width() / 2, 112);
+    }
     else if (sCurrentMode == AppMode::ModePano) {
       if (rpmActive) {
         long rpm = (long)(currentHz * 60);
@@ -851,12 +1042,26 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
 // ==========================================
 void setup() {
   auto cfg = M5.config();
+  // No feature uses external 5V: do not leave its boost converter enabled.
+  cfg.output_power = false;
+  cfg.internal_spk = false;
+  cfg.internal_rtc = false;
   M5.begin(cfg);
+  M5.Power.setExtOutput(false);
+  M5.Speaker.end();
+  M5.Power.setLed(0);
 
   // Explicitly keep the StickS3 charger enabled while the firmware is active.
   // Charge current and voltage are board-hardware controlled, so do not apply
   // values intended for a different PMIC.
   M5.Power.setBatteryCharge(true);
+
+  if (Diagnostics::kPowerLogEnabled) {
+    Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+    Serial.setTxTimeoutMs(0);
+#endif
+  }
 
   delay(200);
   
@@ -867,95 +1072,102 @@ void setup() {
 
   setCpuFrequencyMhz(PowerSave::kCpuFreqActiveMhz); 
   M5.Display.setRotation(1);
-  applyFixedBrightness();
-
-  spr.createSprite(M5.Display.width(), M5.Display.height());
-
-  auto pin_num_sda = M5.getPin(m5::pin_name_t::in_i2c_sda);
-  auto pin_num_scl = M5.getPin(m5::pin_name_t::in_i2c_scl);
-  Wire.end();
-  Wire.begin(pin_num_sda, pin_num_scl, 100000U);
+  M5.Display.setBrightness(PowerSave::kBrightnessActive);
+  if (!spr.createSprite(M5.Display.width(), M5.Display.height())) {
+    M5.Display.drawString("Display allocation failed", 0, 0);
+  }
 
   batteryManager.begin(); // 정돈된 배터리 매니저 시작
 
-  // 이하 마이크 및 IMU(Wire1) 설정 코드는 그대로 유지...
+  // Keep board-supplied I2S pin/codec settings; only change the sample rate.
   auto mic_cfg = M5.Mic.config();
   mic_cfg.sample_rate = Audio::kSamplingFrequency;
-  mic_cfg.pin_data_in = 16;
-  mic_cfg.pin_bck = 17;
-  mic_cfg.pin_ws = 15;
   M5.Mic.config(mic_cfg);
-  M5.Mic.begin();
-  sMicEnabled = true;
+  M5.Mic.end();
+  sMicEnabled = false;
 
-  Wire1.begin(47, 48, 400000); 
-  Wire1.setClock(400000);      
-  Wire1.setTimeOut(10);        
-  Wire1.beginTransmission(0x68);
-  Wire1.write(0x7D); 
-  Wire1.write(0x04); 
-  Wire1.endTransmission();
-  delay(10); 
-  Wire1.beginTransmission(0x68);
-  Wire1.write(0x40); 
-  Wire1.write(0xAC); 
-  Wire1.endTransmission();
-  // Default HIGH mode only uses the microphone; leave the IMU powered down.
-  syncPanoSensorPower();
-  
+  // Use M5Unified's internal I2C owner rather than reinitialising the same bus
+  // through Wire/Wire1 (the microphone codec and PMIC also share it).
+  uint8_t chipId = 0;
+  sBmiPresent = M5.In_I2C.readRegister(0x68, 0x00, &chipId, 1, 400000) && chipId == 0x24;
+  if (sBmiPresent) {
+    const bool configured = M5.In_I2C.writeRegister8(0x68, 0x40, 0xAC, 400000);
+    sBmiPresent = configured;
+  }
+  setBmi270Power(false);
+
   pinMode(kMagPin, INPUT);
 
+  prepareWindows();
+  noteActivity();
   sForceUiRefresh = true;
 }
 
 // ==========================================
-// 메인 루프 (버튼 50ms / 기능 500ms 완전 분리)
+// Main loop: responsive buttons, capped sensor work, independent screen updates
 // ==========================================
 void loop() {
-  unsigned long currentMs = millis();
-
-  // [파트 1] 버튼 체크 및 배터리 업데이트
-  // 💡 CPU가 10MHz일 때는 millis() 속도 체감이 다르므로 슬립 시에는 매 루프마다 체크하도록 오픈합니다.
-  if (sDisplayBlanked || (currentMs - sLastButtonCheckMs >= 50)) {
-    sLastButtonCheckMs = currentMs;
-
+  const unsigned long now = millis();
+  const bool stopwatchStopped = sCurrentMode == AppMode::ModeStopwatch && !sStopwatch.running();
+  const unsigned long buttonPollMs = stopwatchStopped ? PowerSave::kStoppedButtonPollMs : 10;
+  if (now - sLastButtonCheckMs >= buttonPollMs) {
+    sLastButtonCheckMs = now;
     M5.update();
-    handleButtons();         
-    batteryManager.update(); 
+    handleButtons();
   }
-
-  // [파트 2] 슬립 모드(암전 상태)에서의 대기
+  batteryManager.update();
+  logPowerDiagnostics();
+  static bool previousUsb = false;
+  const bool usb = batteryManager.hasExternalPower();
+  if (usb != previousUsb) {
+    previousUsb = usb;
+    noteActivity();
+  }
+  updatePowerSaveState(false);
   if (sDisplayBlanked) {
-    // CPU 속도가 10MHz로 극도로 낮아진 상태이므로, 
-    // 여기서는 delay를 길게 주지 않고 아주 미세하게만 쉬어주어야 버튼 반응성이 유지됩니다.
-    delay(30); 
+    sleepWhileBlanked();
     return;
   }
 
-  // [파트 3] 깨어있는 상태에서의 센서링 및 디스플레이 제어 (초당 2회)
-  unsigned long executionInterval = Audio::kAnalysisIntervalMs;
-  if (sIsCalibrating) executionInterval = 1;   
-
-  if (currentMs - sLastFuncExecutionMs >= executionInterval) {
-    sLastFuncExecutionMs = currentMs; 
-
-    double currentHz = 0;
-    bool isDetected = false;
-    bool rpmActive = false;
+  // Never increase FFT frequency during calibration; stopwatch needs no sensors.
+  if (sCurrentMode != AppMode::ModeStopwatch && now - sLastFuncExecutionMs >= Audio::kAnalysisIntervalMs) {
+    sLastFuncExecutionMs = now;
+    const uint32_t generation = sMeasurementGeneration;
+    const bool oldDetected = sDetected;
+    const bool oldMagActive = sMagActive;
+    const bool oldError = sSensorError;
+    const double oldGauss = sCurrentGauss;
+    const char oldPole = sCurrentPole;
+    double hz = 0;
+    bool detected = false;
     bool magActive = false;
-
+    bool success = true;
     if (sCurrentMode == AppMode::ModePano) {
-      if (processAudioAndFFT(currentHz, isDetected)) {
-        if (isDetected) lastHz = currentHz;
-        rpmActive = isDetected && currentHz > Audio::kMinValidRpmHz;
-      }
-    } else if (sCurrentMode == AppMode::ModeMag) {
+      success = processAudioAndFFT(hz, detected);
+    } else {
       processMagnetic(magActive);
     }
-
-    updatePowerSaveState(rpmActive || magActive);
-    updateDisplay(currentHz, isDetected, rpmActive, magActive);
+    if (generation == sMeasurementGeneration) {
+      sSensorError = !success;
+      if (!success) resetDetection();
+      sCurrentHz = hz;
+      sDetected = detected;
+      sRpmActive = detected && hz > Audio::kMinValidRpmHz;
+      sMagActive = magActive;
+      if (detected) lastHz = hz;
+      if (oldDetected != detected || oldMagActive != magActive || oldError != sSensorError
+          || fabs(oldGauss - sCurrentGauss) >= 0.1 || oldPole != sCurrentPole) sForceUiRefresh = true;
+      // A failed acquisition must not leave calibration keeping the device awake.
+      if (!success && sIsCalibrating && millis() - sCalibrateStartMs >= 2000) {
+        sIsCalibrating = false;
+        sForceUiRefresh = true;
+      }
+      updatePowerSaveState(sRpmActive || sMagActive);
+    }
   }
-
-  delay(50); 
+  const bool stoppedNow = sCurrentMode == AppMode::ModeStopwatch && !sStopwatch.running();
+  if (!stoppedNow || sForceUiRefresh)
+    updateDisplay(sCurrentHz, sDetected, sRpmActive, sMagActive);
+  // Re-evaluate after button handling: starting the watch restores fast polling.
+  delay(stoppedNow ? PowerSave::kStoppedLoopDelayMs : 10);
 }

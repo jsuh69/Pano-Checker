@@ -2,8 +2,15 @@
 #include <assert.h>
 #include <stdio.h>
 #include <initializer_list>
+#include <cmath>
 
 int main() {
+  // 19mm diameter roller; one rising edge is one turn.
+  assert(std::abs(Speed::kmhFromPulses(1, 1000000) - 0.2148849375) < 1e-9);
+  assert(std::abs(Speed::kmhFromPulses(50, 500000) - 21.48849375) < 1e-7);
+  assert(std::abs(Speed::kmhFromPulses(50, 600000) - 17.90707813) < 1e-7);
+  assert(Speed::kmhFromPulses(0, 500000) == 0);
+  assert(Speed::kmhFromPulses(100, 0) == 0);
   FrontButtonGesture button;
   assert(button.update(false, true, false) == FrontAction::None);
   assert(button.update(true, false, false) == FrontAction::None);

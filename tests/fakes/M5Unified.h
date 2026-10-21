@@ -12,6 +12,24 @@ inline uint64_t fakeUs = 0;
 inline int fakeAdc = 2048;
 inline bool fakeGpioLow = false;
 inline uint8_t fakePowerConfig = 8;
+#define ARDUINO_ISR_ATTR
+using portMUX_TYPE = int;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(mux) ((void)(mux))
+#define portEXIT_CRITICAL(mux) ((void)(mux))
+#define portENTER_CRITICAL_ISR(mux) ((void)(mux))
+#define portEXIT_CRITICAL_ISR(mux) ((void)(mux))
+inline void (*fakeSpeedInterrupt)() = nullptr;
+inline int fakeInterruptPin = -1;
+inline int fakeInterruptMode = -1;
+inline bool fakeSpeedLevelHigh = true;
+inline void fakeDriveSpeedInput(bool high) {
+  const bool changed = fakeSpeedLevelHigh != high;
+  const bool falling = fakeSpeedLevelHigh && !high;
+  fakeSpeedLevelHigh = high;
+  if (changed && ((falling && fakeInterruptMode == 3) || (!falling && fakeInterruptMode == 5) || fakeInterruptMode == 4) && fakeSpeedInterrupt) fakeSpeedInterrupt();
+}
+inline unsigned fakeAdcReads = 0;
 struct FakeSerial {
   bool connected = false;
   int capacity = 256;
@@ -35,10 +53,15 @@ inline unsigned long millis() { return (unsigned long)(fakeUs / 1000); }
 inline unsigned long micros() { return (unsigned long)++fakeUs; }
 inline void delay(unsigned long ms) { fakeUs += ms * 1000; }
 inline bool setCpuFrequencyMhz(unsigned) { return true; }
-constexpr int INPUT = 0, LOW = 0;
+constexpr int INPUT = 0, INPUT_PULLUP = 2, LOW = 0, HIGH = 1, FALLING = 3, CHANGE = 4, RISING = 5;
 inline void pinMode(int, int) {}
-inline int digitalRead(int) { return fakeGpioLow ? 0 : 1; }
-inline int analogRead(int) { return fakeAdc; }
+inline int digitalPinToInterrupt(int pin) { return pin; }
+inline void attachInterrupt(int pin, void (*handler)(), int mode) {
+  fakeSpeedInterrupt = handler; fakeInterruptPin = pin; fakeInterruptMode = mode;
+}
+inline void detachInterrupt(int) { fakeSpeedInterrupt = nullptr; }
+inline int digitalRead(int pin) { return pin == 5 ? (fakeSpeedLevelHigh ? 1 : 0) : (fakeGpioLow ? 0 : 1); }
+inline int analogRead(int) { ++fakeAdcReads; return fakeAdc; }
 inline long map(long x, long lo, long hi, long a, long b) { return (x-lo)*(b-a)/(hi-lo)+a; }
 struct String : std::string {
   using std::string::string;
@@ -104,14 +127,15 @@ struct FakePower {
 struct FakeMic {
   struct Config { unsigned sample_rate = 8000; } cfg;
   bool enabled = false, stuck = false, fail = false;
-  double toneHz = 500, amplitude = 1000;
+  double toneHz = 500, amplitude = 1000, startupToneHz = 0;
+  bool firstFrame = true;
   unsigned starts = 0, records = 0, polls = 0;
   int remaining = 0;
   int16_t* buffer = nullptr;
   size_t length = 0;
   Config config() { return cfg; }
   void config(Config c) { cfg = c; }
-  bool begin() { ++starts; enabled = !fail; return enabled; }
+  bool begin() { ++starts; firstFrame = true; enabled = !fail; return enabled; }
   bool isRunning() const { return enabled; }
   void end() { enabled = false; remaining = 0; }
   bool record(int16_t* data, size_t count, double) {
@@ -124,12 +148,23 @@ struct FakeMic {
     if (stuck) return 1;
     if (remaining && --remaining == 0) {
       for (size_t i = 0; i < length; ++i)
-        buffer[i] = (int16_t)(amplitude * std::sin(2 * M_PI * toneHz * i / cfg.sample_rate));
+        buffer[i] = (int16_t)(amplitude * std::sin(2 * M_PI * (firstFrame && startupToneHz > 0 ? startupToneHz : toneHz) * i / cfg.sample_rate));
     }
+    if (remaining == 0) firstFrame = false;
     return remaining > 0;
   }
 };
 struct FakeI2C {
+  double vibToneHz = 0, vibAmplitude = 1000;
+  int vibAxis = 0;
+  bool vibStuck = false;
+  int vibPowerConfig = 3;
+  bool vibFifoEnabled = false, vibFifoOverflow = false;
+  uint64_t vibFifoEpoch = 0, vibFifoRead = 0;
+  unsigned vibFifoReads = 0;
+  unsigned vibDataReads = 0;
+  bool vibInjectDelay = false;
+  uint64_t vibLastTick = 0;
   bool failRead = false, failWrite = false;
   unsigned reads = 0;
   bool readRegister(int address, int reg, uint8_t* dest, size_t length, unsigned) {
@@ -137,10 +172,48 @@ struct FakeI2C {
     if (failRead) return false;
     std::memset(dest, 0, length);
     if (reg == 0) dest[0] = 0x24;
+    if (address == 0x68 && reg == 0x03)
+      dest[0] = (!vibStuck && fakeUs / 625 > vibLastTick) ? 0x80 : 0;
+    if (address == 0x68 && reg == 0x0C && length == 6) {
+      if (vibInjectDelay && ++vibDataReads == 100) fakeUs += 2000;
+      vibLastTick = fakeUs / 625;
+      for (int axis = 0; axis < 3; ++axis) {
+        const int16_t value = (int16_t)((axis == 2 ? 16000 : 0)
+            + (axis == vibAxis ? vibAmplitude * std::sin(2 * M_PI * vibToneHz * vibLastTick / 1600.0) : 0));
+        dest[axis * 2] = (uint8_t)value;
+        dest[axis * 2 + 1] = (uint8_t)((uint16_t)value >> 8);
+      }
+    }
+    if (address == 0x68 && reg == 0x24 && length == 2) {
+      const uint64_t produced = vibFifoEnabled && !vibStuck ? (fakeUs - vibFifoEpoch) / 625 : vibFifoRead;
+      const unsigned queued = vibFifoOverflow ? 2040 : (unsigned)((produced - vibFifoRead) * 6);
+      dest[0] = queued & 255; dest[1] = queued >> 8;
+    }
+    if (address == 0x68 && reg == 0x26) {
+      ++vibFifoReads;
+      if (vibInjectDelay) fakeUs += 2000;
+      for (size_t frame = 0; frame < length / 6; ++frame) {
+        const uint64_t sample = vibFifoRead++;
+        for (int axis = 0; axis < 3; ++axis) {
+          const int16_t value = (int16_t)((axis == 2 ? 16000 : 0)
+              + (axis == vibAxis ? vibAmplitude * std::sin(2 * M_PI * vibToneHz * sample / 1600.0) : 0));
+          dest[frame * 6 + axis * 2] = (uint8_t)value;
+          dest[frame * 6 + axis * 2 + 1] = (uint16_t)value >> 8;
+        }
+      }
+    }
     if (address == 0x6E && reg == 0x06) dest[0] = fakePowerConfig;
     return true;
   }
-  bool writeRegister8(int, int, int, unsigned) { return !failWrite; }
+  bool writeRegister8(int address, int reg, int value, unsigned) {
+    if (failWrite) return false;
+    if (address == 0x68 && reg == 0x7C) vibPowerConfig = value;
+    if (address == 0x68 && reg == 0x49) vibFifoEnabled = value == 0x40;
+    if (address == 0x68 && reg == 0x7E && value == 0xB0) {
+      vibFifoEpoch = fakeUs; vibFifoRead = 0;
+    }
+    return true;
+  }
 };
 struct FakeM5 {
   struct Config { bool internal_spk = true, internal_rtc = true, output_power = true; };

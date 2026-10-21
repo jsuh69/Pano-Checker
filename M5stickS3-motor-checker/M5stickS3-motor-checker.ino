@@ -21,13 +21,13 @@ static unsigned long sLastFuncExecutionMs = 0; // 센서/FFT/디스플레이 기
 // Constants & Settings
 // ==========================================
 namespace App {
-constexpr char kVersion[] = "0.9.1";
+constexpr char kVersion[] = "0.10.18";
 } // namespace App
 
 namespace Audio {
 // 8 kHz / 1024 samples preserves the previous 7.8125 Hz FFT resolution while
 // roughly halving microphone transfer and FFT work.  It still covers the
-// 400–600 Hz motor band with ample Nyquist margin.
+// 300–650 Hz motor band with ample Nyquist margin.
 constexpr double kSamplingFrequency = 8000;
 constexpr uint16_t kSamples = 1024;
 constexpr uint16_t kVibSamples = 512;
@@ -36,14 +36,10 @@ constexpr int kFftLastUsableBin = (kSamples / 2) - 2;
 constexpr double kMinValidRpmHz = 50.0;
 constexpr double kFftPeakRejectAbove = 4000000.0;
 
-// The motor tone is expected near 400–600 Hz.  The wider reference band is
-// used only to estimate local background noise around that tone.
-constexpr int kMicTargetBandLoHz = 400;
-constexpr int kMicTargetBandHiHz = 600;
-constexpr int kMicReferenceBandLoHz = 350;
-constexpr int kMicReferenceBandHiHz = 650;
-constexpr double kMicMinimumPeakMagnitude = 25000.0;
-constexpr double kTrackedFrequencyToleranceHz = 18.0;
+// Microphone motor search band; single-frame detection without continuity gating.
+constexpr int kMicTargetBandLoHz = 300;
+constexpr int kMicTargetBandHiHz = 650;
+constexpr double kMicMinimumPeakMagnitude = 8000.0;
 constexpr unsigned long kAnalysisIntervalMs = 500;
 } // namespace Audio
 
@@ -61,14 +57,15 @@ constexpr gpio_num_t kFrontButton = GPIO_NUM_11;
 constexpr gpio_num_t kModeButton = GPIO_NUM_12;
 } // namespace PowerSave
 
+namespace Magnetic {
+constexpr unsigned long kAnalysisIntervalMs = 100;
+constexpr double kRiseAlpha = 0.65;
+constexpr double kFallAlpha = 0.35;
+}
+
 namespace BatConfig {
 constexpr int16_t kVbusPresentMinMv = 4200;
 } // namespace BatConfig
-
-namespace Diagnostics {
-constexpr bool kPowerLogEnabled = true;
-constexpr unsigned long kPowerLogIntervalMs = 30000;
-} // namespace Diagnostics
 
 namespace UI {
 constexpr uint16_t COLOR_BG = 0x0000;
@@ -104,7 +101,7 @@ LGFX_Sprite spr(&M5.Display);
 double lastHz = 0;
 bool sForceUiRefresh = false;
 
-enum class AppMode : uint8_t { ModePano, ModeMag, ModeStopwatch };
+enum class AppMode : uint8_t { ModePano, ModeMag, ModeStopwatch, ModeSpeed };
 static AppMode sCurrentMode = AppMode::ModePano;
 
 constexpr int kMagPin = 1;
@@ -121,11 +118,9 @@ static bool sSensorError = false;
 // Assume enabled until setup has explicitly powered down the IMU.
 static bool sBmiEnabled = true;
 static bool sBmiPresent = false;
-static bool sHasTrackedPeak = false;
-static double sTrackedPeakHz = 0;
-static uint8_t sTrackedPeakFrames = 0;
 static unsigned long sSignalContinuousStartMs = 0;
 static bool sSignalContinuous = false;
+static bool sVibTimingRetry = false;
 static double sLastInstGauss = 0;
 static double sCurrentHz = 0;
 static bool sDetected = false;
@@ -136,11 +131,108 @@ static FrontButtonGesture sFrontGesture;
 static uint64_t sFrontPressedMs = 0;
 static uint64_t monotonicMs() { return esp_timer_get_time() / 1000ULL; }
 
+constexpr uint8_t kSpeedPin = 5;
+// Blocked pillar = HIGH. Count only rising edges, one per revolution.
+static portMUX_TYPE sSpeedMux = portMUX_INITIALIZER_UNLOCKED;
+constexpr uint32_t kSpeedHighStableUs = 1000;
+static volatile uint32_t sSpeedPulseCount = 0;
+static volatile uint32_t sSpeedRawCount = 0;
+static volatile uint32_t sSpeedHighStartedUs = 0;
+static volatile bool sSpeedLowEpisode = false, sSpeedPendingHigh = false;
+static uint32_t sSpeedPreviousRaw = 0;
+static uint32_t sSpeedLastRawCount = 0;
+static uint32_t sSpeedTotalRaw = 0, sSpeedTotalAccepted = 0;
+static bool sSpeedCaptureEnabled = false;
+static uint32_t sSpeedPreviousTotal = 0;
+static uint32_t sSpeedLastAcceptedCount = 0;
+static uint32_t sSpeedLastElapsedMs = 0;
+static uint32_t sSpeedWindowStartedMs = 0;
+static double sCurrentSpeedKmh = 0;
+static double sMaximumSpeedKmh = 0;
+static double sCurrentRollerRpm = 0;
+static bool sSpeedActive = false;
+
+static void ARDUINO_ISR_ATTR speedPulseIsr() {
+  const uint32_t nowUs = (uint32_t)micros();
+  const bool high = digitalRead(kSpeedPin) == HIGH;
+  portENTER_CRITICAL_ISR(&sSpeedMux);
+  if (high) {
+    ++sSpeedRawCount;
+    if (sSpeedLowEpisode && !sSpeedPendingHigh) {
+      sSpeedPendingHigh = true;
+      sSpeedHighStartedUs = nowUs;
+    }
+  } else {
+    if (sSpeedPendingHigh
+        && (uint32_t)(nowUs - sSpeedHighStartedUs) >= kSpeedHighStableUs)
+      ++sSpeedPulseCount; // Complete previous passage even if loop was delayed.
+    sSpeedPendingHigh = false; // A shorter HIGH gap merges into the same passage.
+    sSpeedLowEpisode = true;
+  }
+  portEXIT_CRITICAL_ISR(&sSpeedMux);
+}
+
+static void resetSpeedMeasurement() {
+  portENTER_CRITICAL(&sSpeedMux);
+  sSpeedPulseCount = sSpeedRawCount = 0;
+  sSpeedLowEpisode = sSpeedPendingHigh = false;
+  sSpeedHighStartedUs = 0;
+  sSpeedPreviousRaw = sSpeedLastRawCount = 0;
+  sSpeedTotalRaw = sSpeedTotalAccepted = 0;
+  sSpeedPreviousTotal = 0;
+  sSpeedWindowStartedMs = (uint32_t)millis();
+  portEXIT_CRITICAL(&sSpeedMux);
+  sCurrentSpeedKmh = sCurrentRollerRpm = 0;
+  sSpeedActive = false;
+  sSpeedLastAcceptedCount = sSpeedLastElapsedMs = 0;
+  sForceUiRefresh = true;
+}
+
+static void setSpeedCapture(bool enable) {
+  if (enable == sSpeedCaptureEnabled) return;
+  if (!enable) detachInterrupt(digitalPinToInterrupt(kSpeedPin));
+  resetSpeedMeasurement();
+  sSpeedCaptureEnabled = enable;
+  if (enable) attachInterrupt(digitalPinToInterrupt(kSpeedPin), speedPulseIsr, CHANGE);
+}
+
+static void processSpeed() {
+  if (!sSpeedCaptureEnabled) return;
+  portENTER_CRITICAL(&sSpeedMux);
+  if (sSpeedPendingHigh
+      && (uint32_t)((uint32_t)micros() - sSpeedHighStartedUs) >= kSpeedHighStableUs) {
+    ++sSpeedPulseCount;
+    sSpeedPendingHigh = sSpeedLowEpisode = false;
+  }
+  portEXIT_CRITICAL(&sSpeedMux);
+  if (!sSpeedCaptureEnabled
+      || (uint32_t)((uint32_t)millis() - sSpeedWindowStartedMs) < Speed::kSampleWindowUs / 1000) return;
+  portENTER_CRITICAL(&sSpeedMux);
+  const uint32_t total = sSpeedPulseCount;
+  const uint32_t rawTotal = sSpeedRawCount;
+  const uint32_t nowMs = (uint32_t)millis();
+  portEXIT_CRITICAL(&sSpeedMux);
+  const uint32_t elapsedMs = nowMs - sSpeedWindowStartedMs;
+  const uint32_t pulses = total - sSpeedPreviousTotal;
+  sSpeedLastRawCount = rawTotal - sSpeedPreviousRaw;
+  sSpeedPreviousRaw = rawTotal;
+  sSpeedTotalRaw = rawTotal;
+  sSpeedTotalAccepted = total;
+  sSpeedPreviousTotal = total;
+  sSpeedWindowStartedMs = nowMs;
+  sSpeedLastAcceptedCount = pulses;
+  sSpeedLastElapsedMs = elapsedMs;
+  // Use milliseconds directly: no overflow from elapsedMs * 1000 on long stalls.
+  sCurrentRollerRpm = (double)pulses * 60000.0 / Speed::kPulsesPerRevolution / elapsedMs;
+  sCurrentSpeedKmh = sCurrentRollerRpm * (3.14159265358979323846 * Speed::kRollerDiameterMm) * 60.0 / 1000000.0;
+  if (sCurrentSpeedKmh > sMaximumSpeedKmh) sMaximumSpeedKmh = sCurrentSpeedKmh;
+  sSpeedActive = pulses > 0;
+  sForceUiRefresh = true;
+}
+
 static void resetDetection() {
-  sHasTrackedPeak = false;
-  sTrackedPeakHz = 0;
-  sTrackedPeakFrames = 0;
   sSignalContinuous = false;
+  sVibTimingRetry = false;
   sSignalContinuousStartMs = 0;
   sCurrentHz = 0;
   sDetected = sRpmActive = sMagActive = false;
@@ -286,55 +378,27 @@ public:
 
 BatteryManager batteryManager; 
 
-static void logPowerDiagnostics() {
-  static unsigned long lastLogMs = 0;
-  static char line[192];
-  static size_t pending = 0, offset = 0;
-  // No extra sensor/bus work when a serial monitor is not attached.
-  if (!Diagnostics::kPowerLogEnabled || !Serial) {
-    pending = offset = 0;
-    return;
-  }
-  const unsigned long now = millis();
-  if (pending == 0 && now - lastLogMs >= Diagnostics::kPowerLogIntervalMs) {
-    lastLogMs = now;
-    if (Serial.availableForWrite() <= 0) return;
-    uint8_t powerConfig = 0, gpioInputs = 0, imuPower = 0;
-    const bool configOk = M5.In_I2C.readRegister(0x6E, 0x06, &powerConfig, 1, 100000);
-    const bool gpioOk = M5.In_I2C.readRegister(0x6E, 0x12, &gpioInputs, 1, 100000);
-    const bool imuOk = sBmiPresent && M5.In_I2C.readRegister(0x68, 0x7D, &imuPower, 1, 400000);
-    const int length = snprintf(line, sizeof(line),
-        "PWR usb=%u vin=%d bat=%d pct=%d chg=%d en=%d boost=%d imu=%d mic=%u watch=%u\n",
-        (unsigned)batteryManager.hasExternalPower(), (int)M5.Power.getVBUSVoltage(),
-        (int)M5.Power.getBatteryVoltage(), batteryManager.getBatteryPercent(),
-        gpioOk ? ((gpioInputs & 1) ? 0 : 1) : -1,
-        configOk ? ((powerConfig & 1) ? 1 : 0) : -1,
-        configOk ? ((powerConfig & 8) ? 1 : 0) : -1,
-        imuOk ? (int)imuPower : -1, (unsigned)M5.Mic.isRunning(),
-        (unsigned)sStopwatch.running());
-    if (length > 0 && length < (int)sizeof(line)) {
-      pending = (size_t)length;
-      offset = 0;
-    }
-  }
-  // Drain only currently available TX space, including on 64-byte USB FIFOs.
-  // Never wait for the monitor to consume a message.
-  const int available = Serial.availableForWrite();
-  if (pending > 0 && available > 0) {
-    const size_t chunk = pending < (size_t)available ? pending : (size_t)available;
-    const size_t written = Serial.write(reinterpret_cast<const uint8_t*>(line + offset), chunk);
-    pending -= written;
-    offset += written;
-  }
-}
-
+// One shared non-blocking queue keeps PWR/SPD records from interleaving.
 // ==========================================
 // Helper Functions
 // ==========================================
 void setBmi270Power(bool enable) {
   if (enable == sBmiEnabled) return;
-  if ((enable && !sBmiPresent)
-      || !M5.In_I2C.writeRegister8(0x68, 0x7D, enable ? 0x04 : 0x00, 400000)) {
+  bool ok = !enable || sBmiPresent;
+  if (ok && enable) {
+    // Advanced power saving can throttle register access; use performance mode
+    // for the 1600Hz acquisition, restoring APS once the accelerometer is off.
+    ok = M5.In_I2C.writeRegister8(0x68, 0x7C, 0x02, 400000);
+    delay(1);
+    if (ok) ok = M5.In_I2C.writeRegister8(0x68, 0x40, 0xAC, 400000);
+  }
+  if (ok && !enable) ok = M5.In_I2C.writeRegister8(0x68, 0x49, 0, 400000);
+  if (ok) ok = M5.In_I2C.writeRegister8(0x68, 0x7D, enable ? 0x04 : 0x00, 400000);
+  if (ok) {
+    delay(3);
+    if (!enable) ok = M5.In_I2C.writeRegister8(0x68, 0x7C, 0x03, 400000);
+  }
+  if (!ok) {
     sSensorError = true;
     sForceUiRefresh = true;
     return;
@@ -402,39 +466,14 @@ static void cycleSensitivity() {
 
 static double sensitivityThreshold() {
   switch (sSensLevel) {
-    // Microphone sensitivity is determined primarily by peak-to-noise ratio,
-    // not a fixed room-dependent FFT magnitude.
-    case SensLevel::Low:
-    case SensLevel::Mid:
+    // Single-frame magnitude sensitivity; no continuity or local-SNR gate.
+    case SensLevel::Low: return 25000.0;
+    case SensLevel::Mid: return 15000.0;
     case SensLevel::High: return Audio::kMicMinimumPeakMagnitude;
     case SensLevel::Vib: return 5000.0;
     case SensLevel::Auto: return sAutoIsVib ? sAutoThresholdVib : sAutoThresholdMic;
   }
   return Audio::kMicMinimumPeakMagnitude;
-}
-
-static double sensitivityRequiredSnrDb() {
-  switch (sSensLevel) {
-    case SensLevel::Low:  return 12.0;
-    case SensLevel::Mid:  return 9.0;
-    case SensLevel::High: return 6.0;
-    case SensLevel::Auto: return 8.0;
-    case SensLevel::Vib:  return 0.0;
-  }
-  return 9.0;
-}
-
-static uint8_t sensitivityRequiredFrames() {
-  switch (sSensLevel) {
-    // At two analysis frames per second, these accumulate 1–2 seconds of
-    // frequency-consistent evidence before reporting a motor tone.
-    case SensLevel::Low:  return 4;
-    case SensLevel::Mid:  return 3;
-    case SensLevel::High: return 2;
-    case SensLevel::Auto: return 3;
-    case SensLevel::Vib:  return 1;
-  }
-  return 3;
 }
 
 static double sensitivityThresholdUpper() {
@@ -502,6 +541,7 @@ static void wakeDisplay() {
   applyBrightness(PowerSave::kBrightnessActive);
   resetDetection();
   if (sCurrentMode == AppMode::ModePano) syncPanoSensorPower();
+  if (sCurrentMode == AppMode::ModeSpeed) setSpeedCapture(true);
   noteActivity();
   sForceUiRefresh = true;
 }
@@ -515,13 +555,16 @@ static void changeMode() {
   sSensorError = false;
   setMicrophonePower(false);
   setBmi270Power(false);
+  setSpeedCapture(false);
   switch (sCurrentMode) {
     case AppMode::ModePano: sCurrentMode = AppMode::ModeMag; break;
     case AppMode::ModeMag: sCurrentMode = AppMode::ModeStopwatch; break;
-    case AppMode::ModeStopwatch: sCurrentMode = AppMode::ModePano; break;
+    case AppMode::ModeStopwatch: sCurrentMode = AppMode::ModeSpeed; break;
+    case AppMode::ModeSpeed: sCurrentMode = AppMode::ModePano; break;
   }
   if (sCurrentMode == AppMode::ModeMag) startCalibration();
   if (sCurrentMode == AppMode::ModePano) syncPanoSensorPower();
+  if (sCurrentMode == AppMode::ModeSpeed) setSpeedCapture(true);
   // A held front button must never act on the newly selected mode.
   sConsumeButtonsUntilRelease = true;
   sFrontGesture.cancel();
@@ -552,13 +595,22 @@ void handleButtons() {
       M5.BtnA.wasReleased(), M5.BtnA.pressedFor(1000));
   if (action == FrontAction::LongPress) {
     if (sCurrentMode == AppMode::ModeStopwatch) sStopwatch.reset();
+    else if (sCurrentMode == AppMode::ModeSpeed) {
+      sMaximumSpeedKmh = 0;
+      resetSpeedMeasurement();
+    }
     else startCalibration();
     noteActivity();
     sForceUiRefresh = true;
   } else if (action == FrontAction::ShortPress) {
     if (sCurrentMode == AppMode::ModePano) cycleSensitivity();
     else if (sCurrentMode == AppMode::ModeMag) startCalibration();
-    else sStopwatch.toggle(sFrontPressedMs); // Timestamp the press, not its release.
+    else if (sCurrentMode == AppMode::ModeStopwatch)
+      sStopwatch.toggle(sFrontPressedMs); // Timestamp the press, not its release.
+    else if (sCurrentMode == AppMode::ModeSpeed) {
+      sMaximumSpeedKmh = 0;
+      resetSpeedMeasurement();
+    }
     noteActivity();
     sForceUiRefresh = true;
   }
@@ -603,7 +655,8 @@ bool processMagnetic(bool &magActive) {
   }
   
   double instGauss = diffADC * 0.872;
-  double filteredGauss = (sLastInstGauss * 0.75) + (instGauss * 0.25);
+  const double alpha = instGauss > sLastInstGauss ? Magnetic::kRiseAlpha : Magnetic::kFallAlpha;
+  double filteredGauss = sLastInstGauss + alpha * (instGauss - sLastInstGauss);
   sLastInstGauss = filteredGauss;
   sCurrentGauss = filteredGauss;
 
@@ -621,67 +674,97 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   bool useVib = (sSensLevel == SensLevel::Vib || (sSensLevel == SensLevel::Auto && sAutoIsVib) || (sIsCalibrating && sAutoIsVib));
 
   if (useVib) {
+    sVibTimingRetry = false;
     if (!sBmiPresent || !sBmiEnabled) return false;
-    unsigned long start_time = micros();
-    unsigned long next_sample = start_time;
-    float vibMean = 0;
-    int actualSamples = 0;
-
-    for (int i = 0; i < Audio::kVibSamples; i++) {
-        while (micros() - next_sample < 625) { }
-        next_sample += 625;
-        
-        uint8_t bytes[6];
-        if (!M5.In_I2C.readRegister(0x68, 0x0C, bytes, sizeof(bytes), 400000)) {
-          return false; // Discard incomplete frames instead of analysing bad data.
+    static int16_t axisSamples[3][Audio::kVibSamples];
+    double sum[3] = {}, squareSum[3] = {};
+    // Headerless accelerometer-only FIFO: 6 bytes per hardware-timed sample.
+    // Stop on full so overflow cannot silently splice non-contiguous samples.
+    if (!M5.In_I2C.writeRegister8(0x68, 0x49, 0, 400000)
+        || !M5.In_I2C.writeRegister8(0x68, 0x45, 0x88, 400000)
+        || !M5.In_I2C.writeRegister8(0x68, 0x48, 0x01, 400000)
+        || !M5.In_I2C.writeRegister8(0x68, 0x7E, 0xB0, 400000)) return false;
+    delay(1);
+    if (!M5.In_I2C.writeRegister8(0x68, 0x49, 0x40, 400000)) return false;
+    struct FifoStop {
+      ~FifoStop() {
+        if (sBmiEnabled && !M5.In_I2C.writeRegister8(0x68, 0x49, 0, 400000)) sSensorError = true;
+      }
+    } stopFifo;
+    uint16_t collected = 0;
+    const uint64_t startedMs = monotonicMs();
+    uint64_t lastProgressMs = startedMs;
+    while (collected < Audio::kVibSamples) {
+      M5.update(); handleButtons();
+      if (generation != sMeasurementGeneration) return false;
+      uint8_t lengthBytes[2];
+      if (!M5.In_I2C.readRegister(0x68, 0x24, lengthBytes, 2, 400000)) return false;
+      const uint16_t available = lengthBytes[0] | ((lengthBytes[1] & 0x3F) << 8);
+      if (available >= 2040) {
+        sVibTimingRetry = true;
+        sSignalContinuous = false;
+        lastHz = 0;
+        sForceUiRefresh = true;
+        return true;
+      }
+      uint16_t frames = Audio::kVibSamples - collected;
+      if (frames > 16) frames = 16; // Bounded 96-byte reads fit common I2C buffers.
+      if (available < frames * 6) {
+        if (monotonicMs() - lastProgressMs > 100 || monotonicMs() - startedMs > 1000) return false;
+        delay(2); // Yield while hardware fills the FIFO; sample timing is unaffected.
+        continue;
+      }
+      uint8_t bytes[96];
+      if (!M5.In_I2C.readRegister(0x68, 0x26, bytes, frames * 6, 400000)) return false;
+      for (uint16_t frame = 0; frame < frames; ++frame) {
+        for (int axis = 0; axis < 3; ++axis) {
+          const int offset = frame * 6 + axis * 2;
+          const int16_t value = (int16_t)((uint16_t)bytes[offset] | ((uint16_t)bytes[offset + 1] << 8));
+          axisSamples[axis][collected] = value;
+          sum[axis] += value;
+          squareSum[axis] += (double)value * value;
         }
-        int16_t ax = (int16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
-        int16_t ay = (int16_t)((uint16_t)bytes[2] | ((uint16_t)bytes[3] << 8));
-        int16_t az = (int16_t)((uint16_t)bytes[4] | ((uint16_t)bytes[5] << 8));
-        float mag = sqrtf((float)ax * ax + (float)ay * ay + (float)az * az);
-        vReal[actualSamples++] = mag;
-        vibMean += mag;
-
-        if (i > 0 && i % 128 == 0) {
-            M5.update();
-            handleButtons();
-            if (generation != sMeasurementGeneration) return false;
-            next_sample = micros(); 
-        }
+        ++collected;
+      }
+      lastProgressMs = monotonicMs();
+      if (lastProgressMs - startedMs > 1000) return false;
     }
-    
-    unsigned long end_time = micros();
-    const unsigned long elapsedUs = end_time - start_time;
-    if (actualSamples != Audio::kVibSamples || elapsedUs == 0) {
-      return false;
+    // FFT frequency comes from the configured sensor ODR, NOT I2C read duration.
+    sVibActualFs = 1600.0;
+    int selectedAxis = 0;
+    double largestEnergy = -1;
+    for (int axis = 0; axis < 3; ++axis) {
+      const double energy = squareSum[axis] - sum[axis] * sum[axis] / Audio::kVibSamples;
+      if (energy > largestEnergy) { largestEnergy = energy; selectedAxis = axis; }
     }
-    vibMean /= actualSamples;
-    sVibActualFs = (actualSamples * 1000000.0) / (double)elapsedUs;
-    
-    for (int i = 0; i < Audio::kSamples; i++) {
-       if (i < actualSamples) {
-           const int wi = i < actualSamples / 2 ? i : actualSamples - 1 - i;
-           vReal[i] = (vReal[i] - vibMean) * sVibWindow[wi];
-       } else {
-           vReal[i] = 0; 
-       }
-       vImag[i] = 0;
+    const double mean = sum[selectedAxis] / Audio::kVibSamples;
+    for (int i = 0; i < Audio::kSamples; ++i) {
+      if (i < Audio::kVibSamples) {
+        const int wi = i < Audio::kVibSamples / 2 ? i : Audio::kVibSamples - 1 - i;
+        vReal[i] = (axisSamples[selectedAxis][i] - mean) * sVibWindow[wi];
+      } else vReal[i] = 0;
+      vImag[i] = 0;
     }
   } else {
     setMicrophonePower(true);
-    if (!sMicEnabled || !M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
-      setMicrophonePower(false);
-      return false;
-    }
-    // record() queues capture. Do not touch rawBuffer until the producer finishes.
+    if (!sMicEnabled) return false;
     const uint64_t captureStartedMs = monotonicMs();
-    while (M5.Mic.isRecording()) {
-      delay(5); // Yield instead of spinning while the I2S task captures samples.
-      M5.update();
-      handleButtons();
-      if (generation != sMeasurementGeneration || monotonicMs() - captureStartedMs > 500) {
-        setMicrophonePower(false); // end() also joins/cancels the writer.
+    // Restarting ES8311 for every analysis also restarts its analog/DC settling.
+    // Discard one completed frame before analysing the next; still shut down
+    // between analyses rather than keeping the microphone powered indefinitely.
+    for (int frame = 0; frame < 2; ++frame) {
+      if (!M5.Mic.record(rawBuffer, Audio::kSamples, Audio::kSamplingFrequency)) {
+        setMicrophonePower(false);
         return false;
+      }
+      while (M5.Mic.isRecording()) {
+        delay(5);
+        M5.update();
+        handleButtons();
+        if (generation != sMeasurementGeneration || monotonicMs() - captureStartedMs > 500) {
+          setMicrophonePower(false);
+          return false;
+        }
       }
     }
     setMicrophonePower(false);
@@ -702,8 +785,12 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
   if (currentFs <= 0) return false;
   const int searchBandLoHz = useVib ? 150 : Audio::kMicTargetBandLoHz;
   const int searchBandHiHz = useVib ? 750 : Audio::kMicTargetBandHiHz;
-  int binLo = (searchBandLoHz * Audio::kSamples + (int)currentFs - 1) / (int)currentFs;
-  int binHi = (searchBandHiHz * Audio::kSamples) / (int)currentFs;
+  // Include the nearest boundary bins so a real 300Hz peak can be tested
+  // against BOTH neighbours instead of accepting the cropped band's edge.
+  int binLo = useVib ? (searchBandLoHz * Audio::kSamples + (int)currentFs - 1) / (int)currentFs
+                     : (searchBandLoHz * Audio::kSamples) / (int)currentFs;
+  int binHi = useVib ? (searchBandHiHz * Audio::kSamples) / (int)currentFs
+                     : (searchBandHiHz * Audio::kSamples + (int)currentFs - 1) / (int)currentFs;
   if (binLo < Audio::kFftFirstUsableBin) binLo = Audio::kFftFirstUsableBin;
   if (binHi > Audio::kFftLastUsableBin) binHi = Audio::kFftLastUsableBin;
   if (binLo > binHi) return false;
@@ -714,42 +801,6 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     if (vReal[i] > maxVal) {
       maxVal = vReal[i];
       peakIndex = i;
-    }
-  }
-
-  // Use a robust local noise floor, not the absolute loudness of the room.
-  // The fixed array is sufficient for the 350–650 Hz microphone reference
-  // band at 8 kHz / 1024 samples (about 39 FFT bins).
-  double peakToNoiseDb = 0.0;
-  if (!useVib && peakIndex > 0) {
-    int referenceBinLo = (Audio::kMicReferenceBandLoHz * Audio::kSamples
-                         + (int)currentFs - 1) / (int)currentFs;
-    int referenceBinHi = (Audio::kMicReferenceBandHiHz * Audio::kSamples)
-                        / (int)currentFs;
-    if (referenceBinLo < Audio::kFftFirstUsableBin) referenceBinLo = Audio::kFftFirstUsableBin;
-    if (referenceBinHi > Audio::kFftLastUsableBin) referenceBinHi = Audio::kFftLastUsableBin;
-
-    double noiseBins[64];
-    int noiseCount = 0;
-    for (int i = referenceBinLo; i <= referenceBinHi && noiseCount < 64; ++i) {
-      // Do not let the main lobe of the candidate tone raise its own noise floor.
-      if (i < peakIndex - 1 || i > peakIndex + 1) {
-        noiseBins[noiseCount++] = vReal[i];
-      }
-    }
-    for (int i = 1; i < noiseCount; ++i) {
-      double value = noiseBins[i];
-      int j = i - 1;
-      while (j >= 0 && noiseBins[j] > value) {
-        noiseBins[j + 1] = noiseBins[j];
-        --j;
-      }
-      noiseBins[j + 1] = value;
-    }
-    if (noiseCount > 0) {
-      double noiseFloor = noiseBins[noiseCount / 2];
-      if (noiseFloor < 1.0) noiseFloor = 1.0;
-      peakToNoiseDb = 20.0 * log10(maxVal / noiseFloor);
     }
   }
 
@@ -777,7 +828,7 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
     }
   }
 
-  if (maxVal > sensitivityThresholdUpper()) {
+  if ((useVib || sSensLevel == SensLevel::Auto) && maxVal > sensitivityThresholdUpper()) {
     maxVal = 0;
     peakIndex = 0;
   }
@@ -801,28 +852,21 @@ bool processAudioAndFFT(double &outHz, bool &outDetected) {
 
   bool isInstantDetected = (maxVal >= sensitivityThreshold());
   if (!useVib) {
-    isInstantDetected = isInstantDetected
-                      && peakHz >= Audio::kMicTargetBandLoHz
-                      && peakHz <= Audio::kMicTargetBandHiHz
-                      && peakToNoiseDb >= sensitivityRequiredSnrDb();
-
-
-    if (isInstantDetected) {
-      if (sHasTrackedPeak && fabs(peakHz - sTrackedPeakHz) <= Audio::kTrackedFrequencyToleranceHz) {
-        if (sTrackedPeakFrames < 255) ++sTrackedPeakFrames;
-        // This running average accumulates consecutive spectra, following a
-        // genuine motor speed change without accepting a sudden tonal noise.
-        sTrackedPeakHz = sTrackedPeakHz * 0.7 + peakHz * 0.3;
-      } else {
-        sHasTrackedPeak = true;
-        sTrackedPeakHz = peakHz;
-        sTrackedPeakFrames = 1;
-      }
-      outDetected = sTrackedPeakFrames >= sensitivityRequiredFrames();
-      if (outDetected) outHz = sTrackedPeakHz;
-    } else {
-      sHasTrackedPeak = false;
-      sTrackedPeakFrames = 0;
+    const bool localPeak = peakIndex > 0 && peakIndex < Audio::kSamples / 2 - 1
+        && vReal[peakIndex] > vReal[peakIndex - 1]
+        && vReal[peakIndex] >= vReal[peakIndex + 1];
+    // Parabolic interpolation has finite error at the exact band boundaries.
+    // Half a bin is the boundary uncertainty, not an expanded operating band.
+    const double boundaryToleranceHz = currentFs / Audio::kSamples * 0.5;
+    // Report each valid microphone spectrum immediately. Discontinuous capture
+    // cannot establish acoustic continuity between the 128ms recordings.
+    outDetected = isInstantDetected && localPeak
+               && peakHz >= Audio::kMicTargetBandLoHz - boundaryToleranceHz
+               && peakHz <= Audio::kMicTargetBandHiHz + boundaryToleranceHz;
+    if (outDetected) {
+      outHz = peakHz;
+      if (outHz < Audio::kMicTargetBandLoHz) outHz = Audio::kMicTargetBandLoHz;
+      if (outHz > Audio::kMicTargetBandHiHz) outHz = Audio::kMicTargetBandHiHz;
     }
   } else {
     // Preserve the vibration-sensor behaviour: its spectral characteristics
@@ -857,6 +901,7 @@ void updatePowerSaveState(bool active) {
   resetDetection();
   setMicrophonePower(false);
   setBmi270Power(false);
+  setSpeedCapture(false);
   sDisplayBlanked = true;
   applyBrightness(0);
   M5.Display.sleep();
@@ -907,7 +952,8 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
   if (sDisplayBlanked) return; 
 
   static unsigned long lastUpdate = 0;
-  bool isAnyDetected = (sCurrentMode == AppMode::ModePano) ? isDetected : magActive;
+  bool isAnyDetected = sCurrentMode == AppMode::ModePano ? isDetected
+      : (sCurrentMode == AppMode::ModeSpeed ? sSpeedActive : magActive);
   const unsigned long uiPeriod = sCurrentMode == AppMode::ModeStopwatch && sStopwatch.running()
       ? 100 : (isAnyDetected ? PowerSave::kUiRefreshActiveMs : PowerSave::kUiRefreshIdleMs);
   // A stationary screen is redrawn only on state/value changes.
@@ -923,7 +969,8 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
     spr.setFont(&fonts::FreeSans9pt7b);
     spr.setTextDatum(top_left);
     const char* modeLabel = sCurrentMode == AppMode::ModePano ? "PANO"
-        : (sCurrentMode == AppMode::ModeMag ? "MAGNETIC" : "STOPWATCH");
+        : (sCurrentMode == AppMode::ModeMag ? "MAGNETIC"
+        : (sCurrentMode == AppMode::ModeSpeed ? "SPEED" : "STOPWATCH"));
     spr.drawString(modeLabel, 5, 7);
 
     // ── Battery status: stable number plus a charging battery icon ──
@@ -970,6 +1017,11 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
       spr.setFont(&fonts::FreeSans12pt7b);
       spr.drawString("SENSOR ERROR", spr.width() / 2, 65);
     }
+    else if (sCurrentMode == AppMode::ModePano && isVibrationSensorSelected() && sVibTimingRetry) {
+      spr.setTextDatum(top_center);
+      spr.setFont(&fonts::FreeSans9pt7b);
+      spr.drawString("VIB RETRY", spr.width() / 2, 65);
+    }
     else if (sIsCalibrating) {
       if (sCurrentMode == AppMode::ModeMag) {
         spr.setTextColor(UI::COLOR_MAG_VALUE);
@@ -979,6 +1031,26 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
       spr.setFont(&fonts::FreeSans12pt7b);
       spr.drawString("CALIBRATING", spr.width() / 2, 65);
     } 
+    else if (sCurrentMode == AppMode::ModeSpeed) {
+      spr.setFont(&fonts::FreeSans9pt7b);
+      spr.setTextColor(UI::COLOR_SENS_LABEL);
+      spr.setTextDatum(top_left);
+      spr.drawString("IRQ", 5, 30);
+      spr.setTextDatum(top_right);
+      spr.drawString(digitalRead(kSpeedPin) == LOW ? "IN:L" : "IN:H", spr.width() - 5, 30);
+      spr.setTextDatum(top_center);
+      char speedBuf[24];
+      snprintf(speedBuf, sizeof(speedBuf), "%.1f", sCurrentSpeedKmh);
+      spr.setFont(&fonts::FreeSansBold18pt7b);
+      spr.setTextColor(UI::COLOR_MAG_VALUE);
+      spr.drawString(speedBuf, spr.width() / 2, 43);
+      spr.setFont(&fonts::FreeSans9pt7b);
+      spr.drawString("km/h", spr.width() / 2, 89);
+      spr.setTextColor(UI::COLOR_TEXT);
+      char counts[40];
+      snprintf(counts, sizeof(counts), "MAX %.1f", sMaximumSpeedKmh);
+      spr.drawString(counts, spr.width() / 2, 112);
+    }
     else if (sCurrentMode == AppMode::ModeStopwatch) {
       const uint64_t elapsed = sStopwatch.elapsedMs(monotonicMs());
       const unsigned long hours = (unsigned long)(elapsed / 3600000ULL);
@@ -1056,13 +1128,6 @@ void setup() {
   // values intended for a different PMIC.
   M5.Power.setBatteryCharge(true);
 
-  if (Diagnostics::kPowerLogEnabled) {
-    Serial.begin(115200);
-#if ARDUINO_USB_CDC_ON_BOOT
-    Serial.setTxTimeoutMs(0);
-#endif
-  }
-
   delay(200);
   
 #if defined(ESP32)
@@ -1097,6 +1162,7 @@ void setup() {
   setBmi270Power(false);
 
   pinMode(kMagPin, INPUT);
+  pinMode(kSpeedPin, INPUT_PULLUP);
 
   prepareWindows();
   noteActivity();
@@ -1116,21 +1182,24 @@ void loop() {
     handleButtons();
   }
   batteryManager.update();
-  logPowerDiagnostics();
   static bool previousUsb = false;
   const bool usb = batteryManager.hasExternalPower();
   if (usb != previousUsb) {
     previousUsb = usb;
     noteActivity();
   }
-  updatePowerSaveState(false);
+  if (sCurrentMode == AppMode::ModeSpeed && !sDisplayBlanked) processSpeed();
+  updatePowerSaveState(sCurrentMode == AppMode::ModeSpeed && sSpeedActive);
   if (sDisplayBlanked) {
     sleepWhileBlanked();
     return;
   }
 
-  // Never increase FFT frequency during calibration; stopwatch needs no sensors.
-  if (sCurrentMode != AppMode::ModeStopwatch && now - sLastFuncExecutionMs >= Audio::kAnalysisIntervalMs) {
+  // Faster ADC-only magnetic work; FFT remains capped at two analyses/second.
+  const unsigned long analysisIntervalMs = sCurrentMode == AppMode::ModeMag
+      ? Magnetic::kAnalysisIntervalMs : Audio::kAnalysisIntervalMs;
+  if ((sCurrentMode == AppMode::ModePano || sCurrentMode == AppMode::ModeMag)
+      && now - sLastFuncExecutionMs >= analysisIntervalMs) {
     sLastFuncExecutionMs = now;
     const uint32_t generation = sMeasurementGeneration;
     const bool oldDetected = sDetected;

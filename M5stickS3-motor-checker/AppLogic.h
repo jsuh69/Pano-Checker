@@ -1,6 +1,19 @@
 #pragma once
 #include <stdint.h>
 
+namespace Speed {
+constexpr double kRollerDiameterMm = 19.0;
+constexpr uint32_t kPulsesPerRevolution = 1;
+constexpr uint32_t kSampleWindowUs = 500000;
+
+inline double kmhFromPulses(uint32_t pulses, uint32_t elapsedUs) {
+  if (elapsedUs == 0) return 0;
+  constexpr double pi = 3.14159265358979323846;
+  const double metersPerPulse = pi * kRollerDiameterMm / 1000.0 / kPulsesPerRevolution;
+  return pulses * metersPerPulse * 3600000.0 / elapsedUs;
+}
+} // namespace Speed
+
 enum class FrontAction : uint8_t { None, ShortPress, LongPress };
 class FrontButtonGesture {
  public:

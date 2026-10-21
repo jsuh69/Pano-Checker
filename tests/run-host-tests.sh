@@ -16,4 +16,9 @@ compiler="${CXX:-c++}"
   "$project_dir/tests/firmware_test.cpp" "$fft_src/arduinoFFT.cpp" \
   -o "$build_dir/firmware-test"
 "$build_dir/firmware-test"
+"$compiler" -std=c++17 -Wall -Wextra -Werror -Wno-unused-function \
+  -I "$project_dir/tests/fakes" -I "$fft_src" \
+  "$project_dir/tests/speed_test.cpp" "$fft_src/arduinoFFT.cpp" \
+  -o "$build_dir/speed-test"
+"$build_dir/speed-test"
 printf 'Test binaries: %s\n' "$build_dir"

@@ -131,7 +131,7 @@ static FrontButtonGesture sFrontGesture;
 static uint64_t sFrontPressedMs = 0;
 static uint64_t monotonicMs() { return esp_timer_get_time() / 1000ULL; }
 
-constexpr uint8_t kSpeedPin = 5;
+constexpr uint8_t kSpeedPin = 8;
 // Blocked pillar = HIGH. Count only rising edges, one per revolution.
 static portMUX_TYPE sSpeedMux = portMUX_INITIALIZER_UNLOCKED;
 constexpr uint32_t kSpeedHighStableUs = 1000;

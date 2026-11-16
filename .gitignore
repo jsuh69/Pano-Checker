@@ -1,1 +1,6 @@
 .DS_Store
+
+# Build outputs and local packaging inputs; distribute binaries as release assets.
+/output/
+/tmp/
+/ESP32-Windows-Installer-Kit.zip

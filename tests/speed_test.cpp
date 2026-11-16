@@ -57,8 +57,12 @@ int main() {
   for (int i = 0; i < 70; ++i) passage(60, 7090);
   processSpeed(); const double peak = sMaximumSpeedKmh;
   assert(peak > 29 && peak == sCurrentSpeedKmh);
+  assert(std::abs(sSpeedTrend.maximum() - peak) < 0.1);
   delay(500); processSpeed();
   assert(sCurrentSpeedKmh == 0 && sMaximumSpeedKmh == peak);
+  uint16_t graphOffset;
+  assert(sSpeedTrend.hasPoint(119));
+  assert(sSpeedTrend.orderedPoint(119, 2, graphOffset) == 0);
   for (int i = 0; i < 35; ++i) passage(60, 14240);
   processSpeed(); assert(sCurrentSpeedKmh < peak && sMaximumSpeedKmh == peak);
   for (int i = 0; i < 100; ++i) passage(60, 4950);
@@ -85,6 +89,7 @@ int main() {
   sStopwatch.toggle(monotonicMs());
   frontButton(false);
   assert(sSpeedPulseCount == 0 && sStopwatch.running() && sMaximumSpeedKmh == 0);
+  assert(!sSpeedTrend.hasPoint(119) && sSpeedTrend.maximum() == 0);
   sMaximumSpeedKmh = 42;
   passage(100, 100); frontButton(true);
   assert(sMaximumSpeedKmh == 0);

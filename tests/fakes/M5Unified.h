@@ -10,6 +10,7 @@
 
 inline uint64_t fakeUs = 0;
 inline int fakeAdc = 2048;
+inline int fakeAdcJitter = 0;
 inline bool fakeGpioLow = false;
 inline uint8_t fakePowerConfig = 8;
 #define ARDUINO_ISR_ATTR
@@ -60,16 +61,16 @@ inline void attachInterrupt(int pin, void (*handler)(), int mode) {
   fakeSpeedInterrupt = handler; fakeInterruptPin = pin; fakeInterruptMode = mode;
 }
 inline void detachInterrupt(int) { fakeSpeedInterrupt = nullptr; }
-inline int digitalRead(int pin) { return pin == 5 ? (fakeSpeedLevelHigh ? 1 : 0) : (fakeGpioLow ? 0 : 1); }
-inline int analogRead(int) { ++fakeAdcReads; return fakeAdc; }
+inline int digitalRead(int pin) { return pin == 8 ? (fakeSpeedLevelHigh ? 1 : 0) : (fakeGpioLow ? 0 : 1); }
+inline int analogRead(int) { ++fakeAdcReads; return fakeAdc + ((fakeAdcReads % 2) ? fakeAdcJitter : -fakeAdcJitter); }
 inline long map(long x, long lo, long hi, long a, long b) { return (x-lo)*(b-a)/(hi-lo)+a; }
 struct String : std::string {
   using std::string::string;
   String(long value) : std::string(std::to_string(value)) {}
   String(const std::string& value) : std::string(value) {}
 };
-namespace fonts { inline int FreeSans9pt7b, FreeSans12pt7b, FreeSans18pt7b, FreeSansBold18pt7b; }
-constexpr int top_left = 0, top_right = 1, top_center = 2;
+namespace fonts { inline int Font0, Font2, FreeSans9pt7b, FreeSans12pt7b, FreeSans18pt7b, FreeSansBold18pt7b; }
+constexpr int top_left = 0, top_right = 1, top_center = 2, middle_center = 5;
 struct FakeDisplay {
   int brightness = 25;
   bool sleeping = false;
@@ -87,6 +88,7 @@ struct LGFX_Sprite : FakeDisplay {
   bool createSprite(int, int) { return true; }
   template<class... T> void fillScreen(T...) {}
   template<class... T> void setFont(T...) {}
+  template<class... T> void setTextSize(T...) {}
   template<class... T> void setTextColor(T...) {}
   template<class... T> void setTextDatum(T...) {}
   template<class... T> void drawRightString(T...) {}
@@ -94,6 +96,8 @@ struct LGFX_Sprite : FakeDisplay {
   template<class... T> void fillRect(T...) {}
   template<class... T> void fillRoundRect(T...) {}
   template<class... T> void drawRect(T...) {}
+  template<class... T> void drawLine(T...) {}
+  template<class... T> void drawPixel(T...) {}
   template<class... T> void pushSprite(T...) {}
   int textWidth(const String& value) { return (int)value.size() * 9; }
 };

@@ -12,6 +12,9 @@ static void pressFront(bool held = false) {
   }
   delay(50); M5.BtnA.down = false; M5.BtnA.released = true;
   handleButtons(); M5.BtnA = {};
+  if (sCurrentMode == AppMode::ModeStopwatch && sWatchClicks) {
+    delay(301); handleButtons();
+  }
 }
 static void pressMode() {
   M5.BtnB.down = M5.BtnB.pressed = true; handleButtons();
@@ -100,7 +103,7 @@ int main() {
   pressFront();
   assert(sStopwatch.running());
   delay(1000); pressFront();
-  assert(!sStopwatch.running() && sStopwatch.elapsedMs(monotonicMs()) == 1050);
+  assert(!sStopwatch.running() && sStopwatch.elapsedMs(monotonicMs()) == 1351);
   pressFront();
   assert(sStopwatch.running());
   const auto elapsedBefore = sStopwatch.elapsedMs(monotonicMs());
@@ -142,7 +145,8 @@ int main() {
   // Calibration resets magnetic filter; missing IMU fails without bogus FFT.
   pressMode(); sLastInstGauss = sCurrentGauss = 500;
   bool active;
-  processMagnetic(active); delay(1000); processMagnetic(active);
+  for (int i = 0; i < 10; ++i) { processMagnetic(active); delay(100); }
+  processMagnetic(active);
   assert(!sIsCalibrating && sCurrentGauss == 0);
   // Magnetic samples at 10Hz; rise approaches the new field within ~300ms.
   fakeAdc = (int)sMagBaseline + 100;
@@ -150,11 +154,45 @@ int main() {
   const auto magneticAdcBefore = fakeAdcReads;
   while (monotonicMs() - magneticStart < 400) loop();
   assert(sCurrentGauss > 87.2 * 0.95 && sCurrentGauss <= 87.2);
+  assert(sMagTrend.maximum() == sCurrentGauss && sMagTrend.hasPoint(119));
   assert(fakeAdcReads - magneticAdcBefore >= 96 && fakeAdcReads - magneticAdcBefore <= 160);
   fakeAdc = (int)sMagBaseline;
   for (int i = 0; i < 20; ++i) { delay(100); processMagnetic(active); }
   assert(sCurrentGauss < 0.1);
+  const double magneticPeak = sMagTrend.maximum();
+  delay(100); loop();
+  uint16_t magOffset;
+  assert(sMagTrend.maximum() == magneticPeak && magneticPeak > 80);
+  assert(sMagTrend.orderedPoint(119, 2, magOffset) < 0.1);
+  startCalibration();
+  assert(sMagTrend.maximum() == 0 && !sMagTrend.hasPoint(119));
 
+  // Invalid calibration never keeps the old baseline or records false peaks.
+  delay(1000); processMagnetic(active); // No calibration samples.
+  assert(sMagBaseline < 0 && !active);
+  for (int rail : {0, 4095}) {
+    fakeAdc = rail; startCalibration();
+    for (int i = 0; i < 10; ++i) { processMagnetic(active); delay(100); }
+    processMagnetic(active); assert(sMagBaseline < 0 && !active);
+  }
+  startCalibration();
+  for (int i = 0; i < 10; ++i) {
+    fakeAdc = (i % 2) ? 2200 : 1800;
+    processMagnetic(active); delay(100);
+  }
+  processMagnetic(active); assert(sMagBaseline < 0 && sCurrentGauss == 0);
+  // Burst noise with a stable mean must also fail calibration.
+  fakeAdc = 2000; fakeAdcJitter = 200; startCalibration();
+  for (int i = 0; i < 10; ++i) { processMagnetic(active); delay(100); }
+  processMagnetic(active); assert(sMagBaseline < 0 && !active);
+  fakeAdcJitter = 0;
+  fakeAdc = 2000; startCalibration();
+  for (int i = 0; i < 10; ++i) { processMagnetic(active); delay(100); }
+  processMagnetic(active); assert(sMagBaseline == 2000 && sCurrentGauss == 0);
+  fakeAdc = 4095; delay(100); loop();
+  assert(sMagBaseline < 0 && sCurrentGauss == 0 && !sMagTrend.hasPoint(119));
+  fakeAdc = 2000; delay(100); loop();
+  assert(sMagBaseline < 0); // Recovery requires explicit recalibration.
   pressMode(); pressMode(); pressMode();
   sSensLevel = SensLevel::Vib; syncPanoSensorPower();
   M5.In_I2C.failRead = true;
@@ -214,5 +252,52 @@ int main() {
   const auto analysisStart = monotonicMs();
   while (monotonicMs() - analysisStart < 2000) loop();
   assert(M5.Mic.records - calibratedRecords >= 6 && M5.Mic.records - calibratedRecords <= 8);
+  // PANO single click waits; double click resets history without changing sensitivity.
+  sIsCalibrating = false; sConsumeButtonsUntilRelease = false;
+  sSensLevel = SensLevel::Low; sPanoClickPending = sPanoSecondPress = false;
+  sPanoTrend.observe(monotonicMs(), 467, true);
+  pressFront(); assert(sSensLevel == SensLevel::Low);
+  delay(100); pressFront();
+  assert(sPanoTrend.maximum() == 0 && sSensLevel == SensLevel::Low);
+  delay(400); handleButtons(); assert(sSensLevel == SensLevel::Low);
+  pressFront(); delay(301); handleButtons(); assert(sSensLevel == SensLevel::Mid);
+  sPanoTrend.observe(monotonicMs(), 467, true);
+  cycleSensitivity(); assert(sSensLevel == SensLevel::High && sPanoTrend.maximum() == 467);
+  cycleSensitivity(); assert(sSensLevel == SensLevel::Vib && sPanoTrend.maximum() == 0);
+  pressFront(true); assert(sIsCalibrating && !sPanoClickPending);
+  // Stopped-only multi-click selection; running clicks record exact finish times.
+  sCurrentMode = AppMode::ModeStopwatch; sIsCalibrating = false;
+  sConsumeButtonsUntilRelease = false; sFrontGesture.cancel();
+  sWatchClicks = 0; sWatchLanes = 0; sStopwatch.reset(); clearWatchLaps();
+  auto watchClicks = [](unsigned clicks) {
+    for (unsigned i = 0; i < clicks; ++i) {
+      M5.BtnA = {}; M5.BtnA.down = M5.BtnA.pressed = true; handleButtons();
+      M5.BtnA.pressed = false; delay(20);
+      M5.BtnA.down = false; M5.BtnA.released = true; handleButtons();
+      M5.BtnA = {}; delay(40); handleButtons();
+    }
+    delay(301); handleButtons();
+  };
+  for (unsigned lanes : {3U, 5U}) {
+    watchClicks(lanes);
+    assert(sWatchLanes == lanes && !sStopwatch.running() && sWatchLapCount == 0);
+    pressFront(); assert(sStopwatch.running());
+    for (unsigned i = 0; i < lanes; ++i) {
+      delay(100);
+      const auto expectedLap = sStopwatch.elapsedMs(monotonicMs());
+      pressFront();
+      assert(sWatchLapCount == i + 1 && sWatchLaps[i] == expectedLap);
+      assert(sStopwatch.running() == (i + 1 < lanes));
+    }
+    const auto finished = sStopwatch.elapsedMs(monotonicMs());
+    delay(1000); assert(sStopwatch.elapsedMs(monotonicMs()) == finished);
+    assert(sWatchLaps[lanes - 1] == finished);
+    pressFront(); assert(sStopwatch.running() && sWatchLapCount == 0);
+    pressFront(true); assert(!sStopwatch.running() && sWatchLapCount == 0);
+  }
+  watchClicks(2); assert(sWatchLanes == 0 && !sStopwatch.running());
+  watchClicks(4); assert(sWatchLanes == 0 && !sStopwatch.running());
+  pressFront(); assert(sStopwatch.running());
+  pressFront(); assert(!sStopwatch.running());
   std::cout << "PASS: production FFT/capture timeout/cancellation, mode/buttons, stopwatch, sleep/USB, magnetic calibration and IMU failure\n";
 }

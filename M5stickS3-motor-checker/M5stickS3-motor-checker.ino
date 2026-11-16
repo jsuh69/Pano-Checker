@@ -2,6 +2,7 @@
 #include <arduinoFFT.h>
 #include <cmath>
 #include "AppLogic.h"
+#include "PanoTrend.h"
 #include <esp_timer.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
@@ -107,7 +108,16 @@ static AppMode sCurrentMode = AppMode::ModePano;
 constexpr int kMagPin = 1;
 static double sMagBaseline = -1; 
 static double sCurrentGauss = 0; 
-static char sCurrentPole = ' ';  
+static char sCurrentPole = ' ';
+// Conservative input-quality checks; these do not prove sensor presence.
+namespace MagInput {
+constexpr int kRailMargin = 16;
+constexpr int kBatchSpread = 128;
+constexpr int kCalibrationSpread = 64;
+constexpr int kMinCalibrationFrames = 5;
+}
+static double sMagCalMin = 4095, sMagCalMax = 0;
+static bool sMagCalInvalid = false;
 
 static bool sDisplayBlanked = false;
 static uint64_t sLastActivityMs = 0;
@@ -128,8 +138,55 @@ static bool sRpmActive = false;
 static bool sMagActive = false;
 static Stopwatch sStopwatch;
 static FrontButtonGesture sFrontGesture;
+static PanoTrend sPanoTrend;
+static PanoTrend sSpeedTrend(true);
+static PanoTrend sMagTrend(true);
+static uint64_t sLastMagGraphUiMs = 0;
+static bool sPanoClickPending = false, sPanoSecondPress = false;
+static uint64_t sPanoClickMs = 0;
+static void resetPanoTrend() {
+  sPanoTrend.reset(esp_timer_get_time() / 1000ULL);
+  sForceUiRefresh = true;
+}
 static uint64_t sFrontPressedMs = 0;
 static uint64_t monotonicMs() { return esp_timer_get_time() / 1000ULL; }
+
+// Multi-click selection is available only while stopped. Running clicks are
+// immediate finish timestamps, so close finishes cannot become mode gestures.
+static uint8_t sWatchLanes = 0, sWatchLapCount = 0, sWatchClicks = 0;
+static uint64_t sWatchLaps[5] = {};
+static uint64_t sWatchClickStartedMs = 0, sWatchClickReleasedMs = 0;
+static void clearWatchLaps() {
+  sWatchLapCount = 0;
+  for (auto &lap : sWatchLaps) lap = 0;
+}
+static void finishWatchClicks() {
+  const uint8_t clicks = sWatchClicks;
+  sWatchClicks = 0;
+  if (clicks == 1) {
+    if (sWatchLanes && sWatchLapCount == sWatchLanes) {
+      sStopwatch.reset(); clearWatchLaps();
+    }
+    sStopwatch.toggle(sWatchClickStartedMs);
+  } else if (clicks == 2 || clicks == 3 || clicks == 5) {
+    sWatchLanes = clicks == 2 ? 0 : clicks;
+    sStopwatch.reset(); clearWatchLaps();
+  }
+  sForceUiRefresh = true;
+}
+static void watchShortPress() {
+  if (sStopwatch.running()) {
+    if (sWatchLanes) {
+      sWatchLaps[sWatchLapCount++] = sStopwatch.elapsedMs(sFrontPressedMs);
+      if (sWatchLapCount == sWatchLanes) sStopwatch.toggle(sFrontPressedMs);
+    } else sStopwatch.toggle(sFrontPressedMs);
+  } else {
+    if (!sWatchClicks) sWatchClickStartedMs = sFrontPressedMs;
+    if (sWatchClicks < 6) ++sWatchClicks;
+    sWatchClickReleasedMs = monotonicMs();
+  }
+}
+
 
 constexpr uint8_t kSpeedPin = 8;
 // Blocked pillar = HIGH. Count only rising edges, one per revolution.
@@ -226,6 +283,7 @@ static void processSpeed() {
   sCurrentRollerRpm = (double)pulses * 60000.0 / Speed::kPulsesPerRevolution / elapsedMs;
   sCurrentSpeedKmh = sCurrentRollerRpm * (3.14159265358979323846 * Speed::kRollerDiameterMm) * 60.0 / 1000000.0;
   if (sCurrentSpeedKmh > sMaximumSpeedKmh) sMaximumSpeedKmh = sCurrentSpeedKmh;
+  sSpeedTrend.observe(monotonicMs(), sCurrentSpeedKmh, true);
   sSpeedActive = pulses > 0;
   sForceUiRefresh = true;
 }
@@ -448,6 +506,7 @@ static void syncPanoSensorPower() {
 }
 
 static void cycleSensitivity() {
+  const bool wasVib = isVibrationSensorSelected();
   ++sMeasurementGeneration;
   sIsCalibrating = false;
   sSensorError = false;
@@ -459,6 +518,7 @@ static void cycleSensitivity() {
     case SensLevel::Vib:     sSensLevel = SensLevel::Low; break;
     case SensLevel::Auto:    sSensLevel = SensLevel::Low; break;
   }
+  if (wasVib != isVibrationSensorSelected()) resetPanoTrend();
   if (sCurrentMode == AppMode::ModePano && !sDisplayBlanked) {
     syncPanoSensorPower();
   }
@@ -522,6 +582,14 @@ String formatNumber(long n) {
 // Core Logic Functions
 // ==========================================
 void startCalibration() {
+  // A new baseline starts a new magnetic measurement session.
+  if (sCurrentMode == AppMode::ModeMag) {
+    sMagTrend.reset(monotonicMs());
+    sMagBaseline = -1;
+    sLastInstGauss = sCurrentGauss = 0;
+    sCurrentPole = ' ';
+    sMagCalMin = 4095; sMagCalMax = 0; sMagCalInvalid = false;
+  }
   ++sMeasurementGeneration;
   resetDetection();
   sSensorError = false;
@@ -547,6 +615,8 @@ static void wakeDisplay() {
 }
 
 static void changeMode() {
+  sWatchClicks = 0;
+  sPanoClickPending = sPanoSecondPress = false;
   ++sMeasurementGeneration;
   sIsCalibrating = false;
   sCalibrateSum = 0;
@@ -575,6 +645,8 @@ static void changeMode() {
 void handleButtons() {
   if (sConsumeButtonsUntilRelease) {
     sFrontGesture.cancel();
+    sWatchClicks = 0;
+    sPanoClickPending = sPanoSecondPress = false;
     if (M5.BtnA.isReleased() && M5.BtnB.isReleased()) {
       sConsumeButtonsUntilRelease = false;
     }
@@ -590,25 +662,51 @@ void handleButtons() {
     changeMode();
     return;
   }
+  if (sCurrentMode == AppMode::ModePano) {
+    if (M5.BtnA.wasPressed() && sPanoClickPending
+        && monotonicMs() - sPanoClickMs <= 300) sPanoSecondPress = true;
+    if (sPanoClickPending && !sPanoSecondPress && monotonicMs() - sPanoClickMs > 300) {
+      sPanoClickPending = false;
+      cycleSensitivity();
+      sForceUiRefresh = true;
+    }
+  }
+  if (sCurrentMode == AppMode::ModeStopwatch && sWatchClicks
+      && M5.BtnA.isReleased() && !M5.BtnA.wasReleased() && !M5.BtnA.wasPressed()
+      && monotonicMs() - sWatchClickReleasedMs > 300) finishWatchClicks();
   if (M5.BtnA.wasPressed()) sFrontPressedMs = monotonicMs();
   const FrontAction action = sFrontGesture.update(M5.BtnA.wasPressed(),
       M5.BtnA.wasReleased(), M5.BtnA.pressedFor(1000));
   if (action == FrontAction::LongPress) {
-    if (sCurrentMode == AppMode::ModeStopwatch) sStopwatch.reset();
+    sPanoClickPending = sPanoSecondPress = false;
+    if (sCurrentMode == AppMode::ModeStopwatch) {
+      sWatchClicks = 0;
+      sStopwatch.reset(); clearWatchLaps();
+    }
     else if (sCurrentMode == AppMode::ModeSpeed) {
       sMaximumSpeedKmh = 0;
+      sSpeedTrend.reset(monotonicMs());
       resetSpeedMeasurement();
     }
     else startCalibration();
     noteActivity();
     sForceUiRefresh = true;
   } else if (action == FrontAction::ShortPress) {
-    if (sCurrentMode == AppMode::ModePano) cycleSensitivity();
+    if (sCurrentMode == AppMode::ModePano) {
+      if (sPanoSecondPress) {
+        resetPanoTrend();
+        sPanoClickPending = sPanoSecondPress = false;
+      } else {
+        sPanoClickPending = true;
+        sPanoClickMs = monotonicMs();
+      }
+    }
     else if (sCurrentMode == AppMode::ModeMag) startCalibration();
     else if (sCurrentMode == AppMode::ModeStopwatch)
-      sStopwatch.toggle(sFrontPressedMs); // Timestamp the press, not its release.
+      watchShortPress();
     else if (sCurrentMode == AppMode::ModeSpeed) {
       sMaximumSpeedKmh = 0;
+      sSpeedTrend.reset(monotonicMs());
       resetSpeedMeasurement();
     }
     noteActivity();
@@ -616,36 +714,58 @@ void handleButtons() {
   }
 }
 
+static bool readMagneticFrame(double &average) {
+  long sum = 0;
+  int lowest = 4095, highest = 0;
+  for (int i = 0; i < 32; ++i) {
+    const int raw = analogRead(kMagPin);
+    sum += raw;
+    if (raw < lowest) lowest = raw;
+    if (raw > highest) highest = raw;
+  }
+  average = sum / 32.0;
+  return average > MagInput::kRailMargin && average < 4095 - MagInput::kRailMargin
+      && highest - lowest <= MagInput::kBatchSpread;
+}
+
+static void invalidateMagneticInput() {
+  sMagBaseline = -1;
+  sLastInstGauss = sCurrentGauss = 0;
+  sCurrentPole = ' ';
+  sForceUiRefresh = true;
+}
+
 bool processMagnetic(bool &magActive) {
   magActive = false;
   if (sIsCalibrating) {
     if (millis() - sCalibrateStartMs < 1000) {
-      long subSum = 0;
-      for(int i = 0; i < 32; i++) {
-        subSum += analogRead(kMagPin);
-      }
-      sCalibrateSum += (subSum / 32.0);
+      double average;
+      if (!readMagneticFrame(average)) sMagCalInvalid = true;
+      if (average < sMagCalMin) sMagCalMin = average;
+      if (average > sMagCalMax) sMagCalMax = average;
+      sCalibrateSum += average;
       sCalibrateCount++;
       return true;
-    } else {
-      sIsCalibrating = false;
-      if (sCalibrateCount > 0) {
-        sMagBaseline = sCalibrateSum / sCalibrateCount;
-        sLastInstGauss = sCurrentGauss = 0;
-        sCurrentPole = ' ';
-      }
-      sForceUiRefresh = true;
     }
+    sIsCalibrating = false;
+    if (sCalibrateCount < MagInput::kMinCalibrationFrames || sMagCalInvalid
+        || sMagCalMax - sMagCalMin > MagInput::kCalibrationSpread) {
+      invalidateMagneticInput();
+      return true;
+    }
+    sMagBaseline = sCalibrateSum / sCalibrateCount;
+    sLastInstGauss = sCurrentGauss = 0;
+    sCurrentPole = ' ';
+    sForceUiRefresh = true;
   }
 
-  if (sMagBaseline < 0) return true; 
-
-  long rawSum = 0;
-  for(int i = 0; i < 32; i++) {
-    rawSum += analogRead(kMagPin);
+  if (sMagBaseline < 0) return true;
+  double rawVal;
+  if (!readMagneticFrame(rawVal)) {
+    invalidateMagneticInput();
+    return true;
   }
-  double rawVal = rawSum / 32.0; 
-  
+
   sCurrentPole = (rawVal >= sMagBaseline) ? 'S' : 'N';
   double diffADC = fabs(rawVal - sMagBaseline);
   
@@ -948,6 +1068,42 @@ static void sleepWhileBlanked() {
 // ==========================================
 // 디스플레이 렌더링 제어 (색상 조건 교정본)
 // ==========================================
+static void drawTrendGraph(const PanoTrend &trend, bool fractional = false) {
+  constexpr int left = 28, right = 234, top = 82, bottom = 120;
+  const uint16_t grid = 0x4208;
+  spr.setFont(&fonts::Font0);
+  spr.setTextDatum(top_right);
+  spr.setTextColor(UI::COLOR_TEXT);
+  const double lo = trend.low(), hi = trend.high();
+  char label[16];
+  for (int i = 0; i < 3; ++i) {
+    const int y = top + (bottom - top) * i / 2;
+    snprintf(label, sizeof(label), fractional && hi < 100 ? "%.1f" : "%.0f", hi - (hi - lo) * i / 2);
+    spr.drawString(label, left - 3, y - 3);
+    spr.drawLine(left, y, right, y, grid);
+  }
+  int prevX = 0, prevY = 0;
+  bool connected = false;
+  for (unsigned i = 0; i < PanoTrend::kPoints; ++i) {
+    if (!trend.hasPoint(i)) { connected = false; continue; }
+    for (unsigned order = 0; order < 3; ++order) {
+      uint16_t offset;
+      const double hz = trend.orderedPoint(i, order, offset);
+      const int x = left + (int)((right - left) * (i * PanoTrend::kBucketMs + offset)
+          / (PanoTrend::kPoints * PanoTrend::kBucketMs));
+      const int y = bottom - (int)((hz - lo) * (bottom - top) / (hi - lo));
+      if (connected) spr.drawLine(prevX, prevY, x, y, UI::COLOR_RPM_VALUE);
+      else spr.drawPixel(x, y, UI::COLOR_RPM_VALUE);
+      connected = true; prevX = x; prevY = y;
+    }
+  }
+  spr.setTextDatum(top_left);
+  spr.drawString("-2m", left, 125);
+  spr.drawString("-1m", 119, 125);
+  spr.setTextDatum(top_right);
+  spr.drawString("NOW", right, 125);
+}
+
 void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magActive) {
   if (sDisplayBlanked) return; 
 
@@ -966,48 +1122,44 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
 
     spr.fillScreen(UI::COLOR_BG);
     spr.setTextColor(UI::COLOR_TEXT);
-    spr.setFont(&fonts::FreeSans9pt7b);
+    spr.setFont(&fonts::Font2);
     spr.setTextDatum(top_left);
     const char* modeLabel = sCurrentMode == AppMode::ModePano ? "PANO"
         : (sCurrentMode == AppMode::ModeMag ? "MAGNETIC"
         : (sCurrentMode == AppMode::ModeSpeed ? "SPEED" : "STOPWATCH"));
     spr.drawString(modeLabel, 5, 7);
+    if (sCurrentMode == AppMode::ModeStopwatch && sWatchLanes) {
+      spr.drawString(sWatchLanes == 3 ? "3 lane" : "5 lane", 108, 7);
+    }
 
     // ── Battery status: stable number plus a charging battery icon ──
-    spr.setFont(&fonts::FreeSans9pt7b);
+    spr.setFont(&fonts::Font2);
     const String batteryText = String(batteryManager.getBatteryPercent()) + "%";
     const int batteryTextRight = spr.width() - 5;
     const int batteryTextWidth = spr.textWidth(batteryText);
     spr.setTextColor(UI::COLOR_TEXT);
-    spr.drawRightString(batteryText, batteryTextRight, 12);
+    spr.drawRightString(batteryText, batteryTextRight, 8);
 
     if (batteryManager.hasExternalPower()) {
-      // 16 x 22 px plug-in-battery icon, following the supplied reference.
-      const int iconX = batteryTextRight - batteryTextWidth - 20;
-      const int iconY = 7; // three pixels lower than the previous battery icon
+      // Compact 12 x 16 px USB-connected battery icon.
+      const int iconX = batteryTextRight - batteryTextWidth - 16;
+      const int iconY = 7;
       const uint16_t iconColor = UI::COLOR_TEXT;
-      spr.drawRoundRect(iconX, iconY, 16, 22, 4, iconColor); // battery outline
+      spr.drawRoundRect(iconX, iconY, 12, 16, 3, iconColor);
 
       // Plug prongs, body, and cable stem.
-      spr.fillRect(iconX + 5, iconY + 6, 2, 5, iconColor);
-      spr.fillRect(iconX + 10, iconY + 6, 2, 5, iconColor);
-      spr.fillRect(iconX + 4, iconY + 10, 9, 2, iconColor);
-      spr.fillRoundRect(iconX + 4, iconY + 12, 9, 6, 2, iconColor);
-      spr.fillRect(iconX + 7, iconY + 17, 3, 4, iconColor);
+      spr.fillRect(iconX + 4, iconY + 4, 1, 4, iconColor);
+      spr.fillRect(iconX + 7, iconY + 4, 1, 4, iconColor);
+      spr.fillRect(iconX + 3, iconY + 7, 6, 1, iconColor);
+      spr.fillRoundRect(iconX + 3, iconY + 8, 6, 4, 1, iconColor);
+      spr.fillRect(iconX + 5, iconY + 11, 2, 3, iconColor);
     }
 
     if (sCurrentMode == AppMode::ModePano) {
       spr.setTextColor(UI::COLOR_SENS_LABEL);
-      spr.setFont(&fonts::FreeSans9pt7b);
-      spr.setTextDatum(top_right);
-      spr.drawString(sensitivityLabel(), spr.width() - 5, 30);
-      if (lastHz > 0) {
-        char hzBuf[24];
-        snprintf(hzBuf, sizeof(hzBuf), "%.1f Hz", lastHz);
-        spr.setTextDatum(top_left);
-        spr.setTextColor(UI::COLOR_TEXT);
-        spr.drawString(hzBuf, 5, 30);
-      }
+      spr.setFont(&fonts::Font2);
+      spr.setTextDatum(top_left);
+      spr.drawString(sensitivityLabel(), 58, 7);
     }
 
     spr.setTextDatum(top_center);
@@ -1032,24 +1184,23 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
       spr.drawString("CALIBRATING", spr.width() / 2, 65);
     } 
     else if (sCurrentMode == AppMode::ModeSpeed) {
-      spr.setFont(&fonts::FreeSans9pt7b);
-      spr.setTextColor(UI::COLOR_SENS_LABEL);
       spr.setTextDatum(top_left);
-      spr.drawString("IRQ", 5, 30);
-      spr.setTextDatum(top_right);
-      spr.drawString(digitalRead(kSpeedPin) == LOW ? "IN:L" : "IN:H", spr.width() - 5, 30);
-      spr.setTextDatum(top_center);
-      char speedBuf[24];
-      snprintf(speedBuf, sizeof(speedBuf), "%.1f", sCurrentSpeedKmh);
-      spr.setFont(&fonts::FreeSansBold18pt7b);
-      spr.setTextColor(UI::COLOR_MAG_VALUE);
-      spr.drawString(speedBuf, spr.width() / 2, 43);
+      spr.setTextColor(UI::COLOR_RPM_VALUE);
+      spr.setFont(&fonts::FreeSans12pt7b);
+      char value[32];
+      snprintf(value, sizeof(value), "%.1f km/h", sCurrentSpeedKmh);
+      spr.drawString(value, 4, 30);
+      spr.setFont(&fonts::Font2);
+      snprintf(value, sizeof(value), "%s RPM", formatNumber((long)sCurrentRollerRpm).c_str());
+      spr.drawString(value, 20, 54);
+      spr.setTextColor(UI::COLOR_SENS_LABEL);
+      spr.setFont(&fonts::Font0);
+      spr.drawString("MAX", 153, 30);
       spr.setFont(&fonts::FreeSans9pt7b);
-      spr.drawString("km/h", spr.width() / 2, 89);
-      spr.setTextColor(UI::COLOR_TEXT);
-      char counts[40];
-      snprintf(counts, sizeof(counts), "MAX %.1f", sMaximumSpeedKmh);
-      spr.drawString(counts, spr.width() / 2, 112);
+      snprintf(value, sizeof(value), "%.1f km/h", sMaximumSpeedKmh);
+      if (spr.textWidth(value) > spr.width() - 158) spr.setFont(&fonts::Font2);
+      spr.drawString(value, 153, 43);
+      drawTrendGraph(sSpeedTrend, true);
     }
     else if (sCurrentMode == AppMode::ModeStopwatch) {
       const uint64_t elapsed = sStopwatch.elapsedMs(monotonicMs());
@@ -1058,51 +1209,85 @@ void updateDisplay(double currentHz, bool isDetected, bool rpmActive, bool magAc
       snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02u:%02u.%02u", hours,
           (unsigned)((elapsed / 60000) % 60), (unsigned)((elapsed / 1000) % 60),
           (unsigned)((elapsed / 10) % 100));
-      spr.setFont(&fonts::FreeSans18pt7b);
+      if (sWatchLanes == 5) spr.setFont(&fonts::FreeSans12pt7b);
+      else spr.setFont(&fonts::FreeSans18pt7b);
       spr.setTextColor(UI::COLOR_MAG_VALUE);
-      spr.drawString(timeBuf, spr.width() / 2, 43);
-      spr.setFont(&fonts::FreeSans9pt7b);
-      spr.setTextColor(UI::COLOR_TEXT);
-      spr.drawString(sStopwatch.running() ? "RUNNING" : "STOPPED", spr.width() / 2, 89);
-      spr.drawString("Hold front: RESET", spr.width() / 2, 112);
+      spr.setTextDatum(middle_center);
+      const int lapTop = sWatchLanes == 5 ? 58 : 86;
+      if (sWatchLanes == 5) spr.setTextSize(1.1f);
+      spr.drawString(timeBuf, spr.width() / 2,
+          sWatchLanes == 5 ? 44 : (sWatchLanes == 3 ? (24 + lapTop) / 2 : spr.height() / 2));
+      spr.setTextSize(1.0f);
+      if (sWatchLanes) {
+        const char *labels[] = {"1st lap", "2nd lap", "3rd lap", "4th lap", "5th lap"};
+        spr.setFont(&fonts::Font2);
+        spr.setTextDatum(top_left);
+        for (unsigned i = 0; i < sWatchLanes; ++i) {
+          const int y = lapTop + i * (sWatchLanes == 5 ? 15 : 16);
+          spr.setFont(&fonts::Font2);
+          spr.setTextColor(UI::COLOR_TEXT);
+          spr.drawString(labels[i], 5, y);
+          char lapBuf[32];
+          if (i < sWatchLapCount) {
+            const uint64_t lap = sWatchLaps[i];
+            snprintf(lapBuf, sizeof(lapBuf), "%02lu:%02u:%02u.%02u",
+                (unsigned long)(lap / 3600000ULL), (unsigned)((lap / 60000) % 60),
+                (unsigned)((lap / 1000) % 60), (unsigned)((lap / 10) % 100));
+          } else snprintf(lapBuf, sizeof(lapBuf), "--:--:--.--");
+          spr.drawString(lapBuf, 76, y);
+          if (i > 0 && i < sWatchLapCount) {
+            const uint64_t gap = sWatchLaps[i] - sWatchLaps[i - 1];
+            char gapBuf[32];
+            snprintf(gapBuf, sizeof(gapBuf), "(%lu.%02us)",
+                (unsigned long)(gap / 1000), (unsigned)((gap / 10) % 100));
+            const int gapX = 76 + spr.textWidth(lapBuf) + 4;
+            if (spr.textWidth(gapBuf) > spr.width() - gapX - 3)
+              spr.setFont(&fonts::Font0);
+            spr.drawString(gapBuf, gapX, y);
+          }
+        }
+      }
     }
     else if (sCurrentMode == AppMode::ModePano) {
-      if (rpmActive) {
-        long rpm = (long)(currentHz * 60);
-        spr.setFont(&fonts::FreeSansBold18pt7b);
-        spr.setTextColor(UI::COLOR_RPM_VALUE);
-        spr.drawString(formatNumber(rpm), spr.width() / 2, 52);
-
-        spr.setFont(&fonts::FreeSans12pt7b);
-        spr.drawString("RPM", spr.width() / 2, 95);
-      } else {
-        spr.setTextColor(UI::COLOR_READY);
-        spr.setFont(&fonts::FreeSans12pt7b);
-        spr.drawString("READY", spr.width() / 2, 65);
-      }
-    } 
-    else if (sCurrentMode == AppMode::ModeMag) {
-      spr.setFont(&fonts::FreeSansBold18pt7b);
-      spr.setTextColor(UI::COLOR_MAG_VALUE);
-      
-      char magBuf[32];
-      if (sCurrentPole == 'S' || sCurrentPole == 'N') {
-        snprintf(magBuf, sizeof(magBuf), "%c %.1f G", sCurrentPole, sCurrentGauss);
-      } else {
-        snprintf(magBuf, sizeof(magBuf), "%.1f G", sCurrentGauss);
-      }
-      spr.drawString(magBuf, spr.width() / 2, 52);
-
+      spr.setTextDatum(top_left);
+      spr.setTextColor(UI::COLOR_RPM_VALUE);
+      spr.setFont(&fonts::FreeSans12pt7b);
+      char value[32];
+      if (isDetected) snprintf(value, sizeof(value), "%.1f Hz", currentHz);
+      else snprintf(value, sizeof(value), "--.- Hz");
+      spr.drawString(value, 4, 30);
+      spr.setFont(&fonts::Font2);
+      if (rpmActive) snprintf(value, sizeof(value), "%s RPM", formatNumber((long)(currentHz * 60)).c_str());
+      else snprintf(value, sizeof(value), "-- RPM");
+      spr.drawString(value, 20, 54);
+      spr.setTextColor(UI::COLOR_SENS_LABEL);
+      spr.setFont(&fonts::Font0);
+      spr.drawString("MAX", 153, 30);
       spr.setFont(&fonts::FreeSans9pt7b);
-      spr.setTextColor(UI::COLOR_TEXT);
-      spr.drawString("Magnetic Force", spr.width() / 2, 95);
-      
-      int barWidth = map((long)sCurrentGauss, 0, 1000, 0, spr.width() - 20);
-      if (barWidth > spr.width() - 20) barWidth = spr.width() - 20;
-      if (barWidth < 0) barWidth = 0;
-      
-      spr.drawRect(10, 115, spr.width() - 20, 15, UI::COLOR_TEXT);
-      spr.fillRect(10, 115, barWidth, 15, UI::COLOR_MAG_VALUE);
+      if (sPanoTrend.maximum() > 0) snprintf(value, sizeof(value), "%.1f Hz", sPanoTrend.maximum());
+      else snprintf(value, sizeof(value), "--.- Hz");
+      spr.drawString(value, 153, 43);
+      drawTrendGraph(sPanoTrend);
+    }
+    else if (sCurrentMode == AppMode::ModeMag) {
+      spr.setTextDatum(top_left);
+      spr.setFont(&fonts::FreeSans12pt7b);
+      spr.setTextColor(UI::COLOR_MAG_VALUE);
+      char value[32];
+      if (sMagBaseline >= 0) snprintf(value, sizeof(value), "%.1f G", sCurrentGauss);
+      else snprintf(value, sizeof(value), "- G");
+      spr.drawString(value, 4, 30);
+      spr.setFont(&fonts::Font2);
+      spr.drawString(sCurrentPole == 'N' ? "N" : (sCurrentPole == 'S' ? "S" : "--"), 20, 54);
+      spr.setTextColor(UI::COLOR_SENS_LABEL);
+      spr.setFont(&fonts::Font0);
+      spr.drawString("MAX", 153, 30);
+      spr.setFont(&fonts::FreeSans9pt7b);
+      if (sMagBaseline >= 0) snprintf(value, sizeof(value), "%.1f G", sMagTrend.maximum());
+      else snprintf(value, sizeof(value), "- G");
+      if (spr.textWidth(value) > spr.width() - 158) spr.setFont(&fonts::Font2);
+      spr.drawString(value, 153, 43);
+      drawTrendGraph(sMagTrend, true);
     }
 
     spr.pushSprite(0, 0);
@@ -1164,6 +1349,9 @@ void setup() {
   pinMode(kMagPin, INPUT);
   pinMode(kSpeedPin, INPUT_PULLUP);
 
+  sPanoTrend.reset(monotonicMs());
+  sSpeedTrend.reset(monotonicMs());
+  sMagTrend.reset(monotonicMs());
   prepareWindows();
   noteActivity();
   sForceUiRefresh = true;
@@ -1224,6 +1412,17 @@ void loop() {
       sRpmActive = detected && hz > Audio::kMinValidRpmHz;
       sMagActive = magActive;
       if (detected) lastHz = hz;
+      if (sCurrentMode == AppMode::ModePano) {
+        sPanoTrend.observe(monotonicMs(), hz, success && detected && !sIsCalibrating);
+        sForceUiRefresh = true;
+      } else if (sCurrentMode == AppMode::ModeMag && !sIsCalibrating) {
+        sMagTrend.observe(monotonicMs(), sCurrentGauss, success && sMagBaseline >= 0);
+        // Advance a stationary graph once per second, not on every 100ms ADC tick.
+        if (monotonicMs() - sLastMagGraphUiMs >= 1000) {
+          sLastMagGraphUiMs = monotonicMs();
+          sForceUiRefresh = true;
+        }
+      }
       if (oldDetected != detected || oldMagActive != magActive || oldError != sSensorError
           || fabs(oldGauss - sCurrentGauss) >= 0.1 || oldPole != sCurrentPole) sForceUiRefresh = true;
       // A failed acquisition must not leave calibration keeping the device awake.
